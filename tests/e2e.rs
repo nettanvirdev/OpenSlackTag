@@ -423,6 +423,12 @@ async fn risky_tools_wait_for_the_requesters_click() {
             .any(|u| u["text"].contains("Allowed once by <@U1>")),
         "{resolved:?}"
     );
+    // The answer moves below the card so the thread reads in order: the
+    // first placeholder is deleted and a new one posted after the card.
+    let posts = fake.calls_to("chat.postMessage");
+    assert_eq!(posts.len(), 3, "placeholder, card, placeholder: {posts:?}");
+    assert!(posts[1].contains_key("blocks") && !posts[2].contains_key("blocks"));
+    assert_eq!(fake.calls_to("chat.delete").len(), 1);
 }
 
 #[tokio::test]

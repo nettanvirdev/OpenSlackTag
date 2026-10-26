@@ -72,6 +72,13 @@ fn convert_line(line: &str) -> String {
             convert_inline(trimmed[hashes..].trim()).trim_matches('*')
         );
     }
+    // Slack shows `- item` literally; give list items real bullets.
+    for marker in ["- ", "* ", "+ "] {
+        if let Some(item) = trimmed.strip_prefix(marker) {
+            let indent = &line[..line.len() - trimmed.len()];
+            return format!("{indent}\u{2022} {}", convert_inline(item));
+        }
+    }
     convert_inline(line)
 }
 
@@ -136,7 +143,10 @@ mod tests {
             "See <https://example.com/a_b|the docs> and <https://y.z|x>."
         );
         assert_eq!(to_mrkdwn("~~old~~ new"), "~old~ new");
-        assert_eq!(to_mrkdwn("- item\n- [ ] todo"), "- item\n- [ ] todo");
+        assert_eq!(
+            to_mrkdwn("- item\n  * **sub**\n+ [ ] todo\n-not a list"),
+            "\u{2022} item\n  \u{2022} *sub*\n\u{2022} [ ] todo\n-not a list"
+        );
     }
 
     #[test]

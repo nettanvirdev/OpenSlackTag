@@ -99,6 +99,8 @@ struct TaskOutcome {
     steps: Vec<String>,
     seconds: u64,
     model: String,
+    /// Whether it posted an approval card, below the placeholder.
+    asked: bool,
 }
 
 struct PendingApproval {
@@ -576,11 +578,13 @@ impl Slack {
                 }
             })
         };
+        let asked = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let approver = Arc::new(SlackApprover {
             slack: self.clone(),
             channel: target.channel.clone(),
             thread: target.thread.clone(),
             requester: approver,
+            asked: asked.clone(),
         });
         let tools = slack_tools(self, &target, requester.as_deref());
         let reply = engine
@@ -603,11 +607,22 @@ impl Slack {
             steps,
             seconds: started.elapsed().as_secs(),
             model: engine.model().to_string(),
+            asked: asked.load(std::sync::atomic::Ordering::Relaxed),
         }
     }
 
     async fn finish(&self, target: &Target, placeholder: &str, outcome: TaskOutcome) -> Result<()> {
         let (channel, thread) = (target.channel.as_str(), target.thread.as_deref());
+        // An approval card sits below the placeholder; answer below the card
+        // so the thread reads in order.
+        let moved;
+        let placeholder = if outcome.asked {
+            let _ = self.delete(channel, placeholder).await;
+            moved = self.post(channel, thread, WORKING).await?;
+            moved.as_str()
+        } else {
+            placeholder
+        };
         match outcome.reply {
             Ok(Reply::Answer(text)) => {
                 let footer = format!("{} · {}s", outcome.model, outcome.seconds.max(1));
@@ -1571,6 +1586,7 @@ struct SlackApprover {
     channel: String,
     thread: Option<String>,
     requester: Option<String>,
+    asked: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[async_trait]
@@ -1592,7 +1608,10 @@ impl Approver for SlackApprover {
             .post_blocks(&self.channel, self.thread.as_deref(), &text, &blocks)
             .await
         {
-            Ok(ts) => ts,
+            Ok(ts) => {
+                self.asked.store(true, std::sync::atomic::Ordering::Relaxed);
+                ts
+            }
             Err(e) => {
                 tracing::warn!("Could not post an approval card: {e:#}");
                 self.slack.pending.lock().remove(&id);
@@ -1619,11 +1638,12 @@ impl Approver for SlackApprover {
                 )
             }
         };
-        let summary = format!(
-            "{outcome}: `{}` {}",
-            approval.tool,
+        let target = if is_channel_id(&approval.target) {
+            format!("in <#{}>", approval.target)
+        } else {
             short(&approval.target, 200)
-        );
+        };
+        let summary = format!("{outcome}: `{}` {target}", approval.tool);
         let _ = self
             .slack
             .update_section(&self.channel, &ts, &crate::markdown::escape(&summary))
@@ -1635,11 +1655,18 @@ impl Approver for SlackApprover {
 /// The approval message: fallback text and Block Kit with three buttons.
 fn approval_card(id: &str, approval: &Approval, requester: Option<&str>) -> (String, Value) {
     let who = requester.map_or(String::new(), |r| format!(" <@{r}>,"));
-    let mut body = format!(
-        ":lock:{who} I'd like to use `{}` on:\n```{}```",
-        approval.tool,
-        short(&approval.target, 500)
-    );
+    let mut body = if is_channel_id(&approval.target) {
+        format!(
+            ":lock:{who} I'd like to use `{}` in <#{}>",
+            approval.tool, approval.target
+        )
+    } else {
+        format!(
+            ":lock:{who} I'd like to use `{}` on:\n```{}```",
+            approval.tool,
+            short(&approval.target, 500)
+        )
+    };
     if let Some(detail) = &approval.detail {
         body.push_str(&format!("\nwith:\n```{}```", short(detail, 1500)));
     }
@@ -1672,6 +1699,15 @@ fn approval_card(id: &str, approval: &Approval, requester: Option<&str>) -> (Str
         ),
         blocks,
     )
+}
+
+/// A Slack channel id (public, private or DM), shown as a channel link.
+fn is_channel_id(text: &str) -> bool {
+    text.len() > 8
+        && text.starts_with(['C', 'G', 'D'])
+        && text
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
 }
 
 fn short(text: &str, max: usize) -> String {
@@ -1969,6 +2005,15 @@ old style"
         let buttons = blocks[1]["elements"].as_array().unwrap();
         assert_eq!(buttons.len(), 3);
         assert!(buttons.iter().all(|b| b["value"] == "abc"));
+
+        let post = Approval {
+            tool: "slack_post_message".into(),
+            target: "C0C76NF24BH".into(),
+            detail: None,
+        };
+        let (_, blocks) = approval_card("abc", &post, None);
+        let body = blocks[0]["text"]["text"].as_str().unwrap();
+        assert!(body.contains("in <#C0C76NF24BH>"), "{body}");
     }
 
     #[test]
