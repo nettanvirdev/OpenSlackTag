@@ -1,9 +1,10 @@
 //! The engine turns "messages arrived in a conversation" into "a reply",
-//! whatever the surface: Slack or the local chat.
+//! whatever the surface: Slack, the terminal chat, or a scheduled task.
 //!
 //! It keeps each conversation's full transcript (tool calls included) on disk,
-//! compacts it when it outgrows the context budget, and folds messages that
-//! arrive mid-task into the running task instead of starting a second one.
+//! compacts it when it outgrows the context budget, folds messages that arrive
+//! mid-task into the running task instead of starting a second one, checks
+//! every tool call against the permission rules, and can stop a task on request.
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -13,18 +14,24 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use futures::StreamExt;
-use openslacktag_agent::{Agent, AgentConfig, AgentEvent, DOOM_LOOP_KEY, Steer, StopReason, Turn};
+use openslacktag_agent::{Agent, AgentConfig, AgentEvent, Steer, StopReason, Turn};
 use openslacktag_core::message::{Entry, ToolCall};
-use openslacktag_core::permission::Action;
-use openslacktag_core::tool::{Decision, PermissionGate, PermissionRequest, Tool, ToolRegistry};
+use openslacktag_core::permission::Rule;
+use openslacktag_core::provider::Usage;
+use openslacktag_core::tool::{PermissionGate, Tool, ToolRegistry};
 use openslacktag_core::{Provider, SessionId};
 use openslacktag_mcp::provider::McpProvider;
 use openslacktag_tools::Registry;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use tokio::sync::Notify;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::compact;
+use crate::delegate::DelegateTool;
+use crate::permissions::{Approver, Gate, NobodyToAsk};
+use crate::schedule::{Schedules, schedule_tools};
+use crate::skills::Skills;
 use crate::tools::{Sandbox, Wiki, builtin_tools};
 
 /// A message for the engine, with the surface's position marker (Slack's
@@ -34,6 +41,43 @@ use crate::tools::{Sandbox, Wiki, builtin_tools};
 pub struct Incoming {
     pub cursor: Option<String>,
     pub entry: Entry,
+}
+
+/// Where a conversation's replies go, for tools that post or schedule.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Target {
+    pub channel: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread: Option<String>,
+}
+
+/// One request to the engine: the new messages plus everything the surface
+/// knows about where they came from.
+pub struct Request<'a> {
+    pub conversation: &'a str,
+    pub incoming: Vec<Incoming>,
+    /// Short progress notes ("Using web_fetch: …") while the work runs.
+    pub progress: &'a UnboundedSender<String>,
+    /// Who answers `ask` permission rules.
+    pub approver: Arc<dyn Approver>,
+    /// Where replies go; enables scheduling and posting tools.
+    pub target: Option<Target>,
+    /// Who asked, e.g. a Slack user id.
+    pub requester: Option<String>,
+    /// Extra lines for the system prompt, e.g. which channel this is.
+    pub context: Option<String>,
+    /// Tools that only make sense on this surface (reading Slack, sharing files).
+    pub tools: Vec<Arc<dyn Tool>>,
+}
+
+impl std::fmt::Debug for Request<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Request")
+            .field("conversation", &self.conversation)
+            .field("incoming", &self.incoming.len())
+            .field("target", &self.target)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -55,7 +99,13 @@ pub struct Parts {
     pub mcp: Arc<McpProvider>,
     /// Compact a conversation once it is estimated to exceed this many tokens.
     pub compact_at_tokens: usize,
-    /// Extra tools, for tests and embedders.
+    /// Permission rules: defaults merged with the operator's file.
+    pub rules: Vec<Rule>,
+    /// Operator-written skills (folders with a SKILL.md).
+    pub skills: Skills,
+    /// The operator's standing instructions, added to every system prompt.
+    pub instructions: Option<String>,
+    /// Extra tools: web search when configured, and tools for tests.
     pub extra_tools: Vec<Arc<dyn Tool>>,
 }
 
@@ -69,16 +119,38 @@ impl std::fmt::Debug for Parts {
     }
 }
 
+impl Parts {
+    /// Parts with no sandbox, MCP, skills or instructions, and the default rules.
+    pub fn minimal(provider: Arc<dyn Provider>, model: &str, data_dir: &Path) -> Self {
+        Self {
+            provider,
+            model: model.to_string(),
+            data_dir: data_dir.to_path_buf(),
+            sandbox: None,
+            mcp: Arc::new(McpProvider::new()),
+            compact_at_tokens: 80_000,
+            rules: crate::permissions::default_rules(),
+            skills: Skills::default(),
+            instructions: None,
+            extra_tools: Vec::new(),
+        }
+    }
+}
+
 pub struct Engine {
     provider: Arc<dyn Provider>,
-    registry: Arc<dyn ToolRegistry>,
-    gate: Arc<dyn PermissionGate>,
     config: AgentConfig,
     wiki: Arc<Wiki>,
     mcp: Arc<McpProvider>,
     sandbox: Option<Sandbox>,
     data_dir: PathBuf,
     compact_at_tokens: usize,
+    rules: Vec<Rule>,
+    skills: Skills,
+    instructions: Option<String>,
+    /// Tools every conversation has: builtins, skills, and the extras.
+    tools: Vec<Arc<dyn Tool>>,
+    schedules: Arc<Schedules>,
     running: Mutex<HashMap<String, Running>>,
 }
 
@@ -94,12 +166,16 @@ impl std::fmt::Debug for Engine {
 struct Running {
     steer: Steer,
     cursor: Option<String>,
+    cancel: Arc<Notify>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Saved {
     cursor: Option<String>,
     history: Vec<Entry>,
+    /// Approvals given "always, in this conversation".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    allowed: Vec<Rule>,
 }
 
 impl Engine {
@@ -107,15 +183,13 @@ impl Engine {
         let wiki = Arc::new(
             Wiki::open(parts.data_dir.join("wiki")).context("could not create the wiki folder")?,
         );
-        let gate: Arc<dyn PermissionGate> = Arc::new(AllowAll);
-        let registry = Registry::new(gate.clone())
-            .with_tools(builtin_tools(&wiki, parts.sandbox.as_ref()))
-            .with_tools(parts.extra_tools)
-            .with_provider(parts.mcp.clone());
+        let mut tools = builtin_tools(&wiki, parts.sandbox.as_ref());
+        tools.extend(crate::files::file_tools());
+        tools.extend(parts.skills.tools());
+        tools.extend(parts.extra_tools);
+        let schedules = Arc::new(Schedules::open(parts.data_dir.join("schedules.json")));
         Ok(Self {
             provider: parts.provider,
-            registry: Arc::new(registry),
-            gate,
             config: AgentConfig {
                 model: parts.model,
                 ..AgentConfig::default()
@@ -125,6 +199,11 @@ impl Engine {
             sandbox: parts.sandbox,
             data_dir: parts.data_dir,
             compact_at_tokens: parts.compact_at_tokens,
+            rules: parts.rules,
+            skills: parts.skills,
+            instructions: parts.instructions,
+            tools,
+            schedules,
             running: Mutex::new(HashMap::new()),
         })
     }
@@ -137,9 +216,24 @@ impl Engine {
         &self.config.model
     }
 
-    /// Names of the tools the model is offered, MCP tools included.
+    pub fn schedules(&self) -> &Arc<Schedules> {
+        &self.schedules
+    }
+
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
+    /// Names of the tools the model is offered everywhere, MCP tools included
+    /// and tools the rules deny outright left out.
     pub async fn tool_names(&self) -> Vec<String> {
-        self.registry
+        let gate = Arc::new(Gate::new(
+            self.rules.clone(),
+            Arc::default(),
+            Arc::new(NobodyToAsk),
+            None,
+        ));
+        self.registry(gate, Vec::new())
             .specs()
             .await
             .into_iter()
@@ -160,18 +254,34 @@ impl Engine {
         self.path(conversation).exists()
     }
 
-    /// Take in new messages and answer them. Short progress notes ("Using
-    /// web_fetch: https://...") go to `progress` while the work runs.
-    pub async fn reply(
-        &self,
-        conversation: &str,
-        incoming: Vec<Incoming>,
-        progress: &UnboundedSender<String>,
-    ) -> Result<Reply> {
+    /// Whether a task is running in this conversation.
+    pub fn is_running(&self, conversation: &str) -> bool {
+        self.running.lock().contains_key(conversation)
+    }
+
+    /// Stop the task running in this conversation. Returns false if none was.
+    pub fn cancel(&self, conversation: &str) -> bool {
+        match self.running.lock().get(conversation) {
+            Some(running) => {
+                running.cancel.notify_one();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Take in new messages and answer them.
+    pub async fn reply(&self, request: Request<'_>) -> Result<Reply> {
+        let conversation = request.conversation;
         let mut waited = Duration::ZERO;
-        let (mut steer, mut history, mut fresh) = loop {
-            match self.admit(conversation, &incoming) {
-                Admit::Run(steer, history, fresh) => break (steer, history, fresh),
+        let (mut steer, cancel, saved, mut fresh) = loop {
+            match self.admit(conversation, &request.incoming) {
+                Admit::Run {
+                    steer,
+                    cancel,
+                    saved,
+                    fresh,
+                } => break (steer, cancel, saved, fresh),
                 Admit::Steered => return Ok(Reply::Steered),
                 Admit::Nothing => return Ok(Reply::Nothing),
                 // The running task is finishing and no longer takes messages:
@@ -190,11 +300,16 @@ impl Engine {
             engine: self,
             conversation,
         };
+        let session = Arc::new(Mutex::new(saved.allowed));
+        let mut history = saved.history;
 
         loop {
-            let (final_history, answer) = self
-                .run(conversation, history, fresh, steer.clone(), progress)
+            let outcome = self
+                .run(&request, history, fresh, steer.clone(), &cancel, &session)
                 .await?;
+            if let Some(usage) = &outcome.usage {
+                crate::usage::record(&self.data_dir, conversation, &self.config.model, usage);
+            }
 
             // Finish under the lock, so no message can slip in between the
             // last look at the steering queue and the transcript being saved.
@@ -202,20 +317,22 @@ impl Engine {
             steer.close();
             let left = steer.take();
             let cursor = running.get(conversation).and_then(|r| r.cursor.clone());
-            if left.is_empty() || answer.is_err() {
+            let allowed = session.lock().clone();
+            if left.is_empty() || outcome.answer.is_err() || outcome.cancelled {
                 // Messages accepted for a task that then failed are kept in the
                 // transcript, so they are not lost with it.
-                let mut final_history = final_history;
+                let mut final_history = outcome.history;
                 final_history.extend(left.iter().map(Entry::user));
                 self.save(
                     conversation,
                     &Saved {
                         cursor,
                         history: final_history,
+                        allowed,
                     },
                 )?;
                 running.remove(conversation);
-                return answer.map(Reply::Answer);
+                return outcome.answer.map(Reply::Answer);
             }
             // Messages arrived after the task's last step: answer them too,
             // in a follow-up run that starts from the finished transcript.
@@ -223,7 +340,8 @@ impl Engine {
                 conversation,
                 &Saved {
                     cursor,
-                    history: final_history.clone(),
+                    history: outcome.history.clone(),
+                    allowed,
                 },
             )?;
             steer = Steer::new();
@@ -231,7 +349,7 @@ impl Engine {
                 active.steer = steer.clone();
             }
             drop(running);
-            history = final_history;
+            history = outcome.history;
             fresh = left.iter().map(Entry::user).collect();
         }
     }
@@ -277,33 +395,50 @@ impl Engine {
         }
 
         let steer = Steer::new();
+        let cancel = Arc::new(Notify::new());
         running.insert(
             conversation.to_string(),
             Running {
                 steer: steer.clone(),
                 cursor: newest.or_else(|| saved.cursor.clone()),
+                cancel: cancel.clone(),
             },
         );
-        Admit::Run(
+        Admit::Run {
             steer,
-            saved.history,
-            fresh.into_iter().map(|m| m.entry.clone()).collect(),
+            cancel,
+            fresh: fresh.into_iter().map(|m| m.entry.clone()).collect(),
+            saved,
+        }
+    }
+
+    /// The registry for one task: every tool, checked by this task's gate.
+    fn registry(
+        &self,
+        gate: Arc<dyn PermissionGate>,
+        extra: Vec<Arc<dyn Tool>>,
+    ) -> Arc<dyn ToolRegistry> {
+        Arc::new(
+            Registry::new(gate)
+                .with_tools(self.tools.iter().cloned())
+                .with_tools(extra)
+                .with_provider(self.mcp.clone()),
         )
     }
 
-    /// Run one task. Returns the transcript to save and the answer (or the
-    /// failure, after the transcript so far is kept).
+    /// Run one task.
     async fn run(
         &self,
-        conversation: &str,
+        request: &Request<'_>,
         mut history: Vec<Entry>,
         fresh: Vec<Entry>,
         steer: Steer,
-        progress: &UnboundedSender<String>,
-    ) -> Result<(Vec<Entry>, Result<String>)> {
+        cancel: &Notify,
+        session: &Arc<Mutex<Vec<Rule>>>,
+    ) -> Result<Outcome> {
         history.extend(fresh);
         if compact::estimate_tokens(&history) > self.compact_at_tokens {
-            let _ = progress.send("Compacting the conversation".into());
+            let _ = request.progress.send("Compacting the conversation".into());
             match compact::compact(
                 self.provider.as_ref(),
                 &self.config.model,
@@ -319,57 +454,109 @@ impl Engine {
             }
         }
 
-        let agent = Agent::new(
+        let gate: Arc<dyn PermissionGate> = Arc::new(Gate::new(
+            self.rules.clone(),
+            session.clone(),
+            request.approver.clone(),
+            Some(request.progress.clone()),
+        ));
+        let mut extra = request.tools.clone();
+        if let Some(target) = &request.target {
+            extra.extend(schedule_tools(
+                &self.schedules,
+                target,
+                request.requester.as_deref(),
+            ));
+        }
+        // Helpers get every tool except `delegate` itself, so delegation cannot recurse.
+        let helpers = self.registry(gate.clone(), extra.clone());
+        let system = self.system_prompt(request).await;
+        extra.push(Arc::new(DelegateTool::new(
             self.provider.clone(),
-            self.registry.clone(),
-            self.gate.clone(),
+            helpers,
+            gate.clone(),
             self.config.clone(),
-        )
-        .with_steering(steer);
+            &system,
+        )));
+        let registry = self.registry(gate.clone(), extra);
+
+        let agent = Agent::new(self.provider.clone(), registry, gate, self.config.clone())
+            .with_steering(steer);
         let turn = Turn {
             session: SessionId::new(),
-            system: self.system_prompt().await,
+            system,
             history: history.clone(),
-            root: workspace_dir(&self.data_dir, conversation),
+            root: workspace_dir(&self.data_dir, request.conversation),
         };
 
         let mut events = agent.run(turn);
         let mut done = None;
-        while let Some(event) = events.next().await {
-            match event {
-                AgentEvent::ToolStarted { call, title } => {
-                    let _ = progress.send(describe_call(&call, title.as_deref()));
+        let mut cancelled = false;
+        loop {
+            tokio::select! {
+                event = events.next() => {
+                    let Some(event) = event else { break };
+                    match event {
+                        AgentEvent::ToolStarted { call, title } => {
+                            let _ = request.progress.send(describe_call(&call, title.as_deref()));
+                        }
+                        AgentEvent::Notice { message } => tracing::info!("{message}"),
+                        AgentEvent::Done { stopped, history, usage } => done = Some((stopped, history, usage)),
+                        _ => {}
+                    }
                 }
-                AgentEvent::Notice { message } => tracing::info!("{message}"),
-                AgentEvent::Done {
-                    stopped, history, ..
-                } => done = Some((stopped, history)),
-                _ => {}
+                () = cancel.notified() => {
+                    // Dropping the stream stops the model request and any running tool.
+                    cancelled = true;
+                    break;
+                }
             }
         }
-        let (stopped, final_history) = done.context("the agent stopped without finishing")?;
+        drop(events);
+
+        if cancelled {
+            let mut history = history;
+            history.push(Entry::assistant(
+                "(Stopped at the person's request before finishing.)",
+            ));
+            return Ok(Outcome {
+                history,
+                answer: Ok("_Stopped._".into()),
+                usage: None,
+                cancelled: true,
+            });
+        }
+        let (stopped, final_history, usage) =
+            done.context("the agent stopped without finishing")?;
         let answer = last_answer(&final_history);
         let answer = match stopped {
-            StopReason::Complete | StopReason::Refused => Ok(answer),
+            StopReason::Complete => Ok(answer),
+            // Every call in the last step was refused: say so plainly rather
+            // than spend another model call. The refusal stays in the
+            // transcript, so the next message picks up from it.
+            StopReason::Refused if answer.trim().is_empty() => Ok(REFUSED.to_string()),
+            StopReason::Refused => Ok(answer),
             StopReason::MaxSteps => Ok(format!(
                 "{answer}\n\n_I hit my step limit before finishing. Tell me to continue and I will pick up from here._"
             )),
             StopReason::Cancelled => Ok("_Stopped._".to_string()),
             StopReason::Error { message } => Err(anyhow::anyhow!(message)),
         };
-        Ok((
-            final_history,
-            answer.map(|a| {
+        Ok(Outcome {
+            history: final_history,
+            answer: answer.map(|a| {
                 if a.trim().is_empty() {
                     "Done.".into()
                 } else {
                     a
                 }
             }),
-        ))
+            usage,
+            cancelled: false,
+        })
     }
 
-    async fn system_prompt(&self) -> String {
+    async fn system_prompt(&self, request: &Request<'_>) -> String {
         let pages = match self.wiki.pages() {
             Ok(p) if !p.is_empty() => p.join(", "),
             _ => "(empty)".into(),
@@ -378,10 +565,10 @@ impl Engine {
         let computer = match &self.sandbox {
             Some(s) => format!(
                 "You have your own sandboxed Linux computer (run_shell, image {}, network {}). Use it to run code, \
-                 process data and check your work.",
+                 process data and check your work. Its /work folder is the same folder the file tools use.",
                 s.image, s.network
             ),
-            None => "You have no shell in this deployment.".to_string(),
+            None => "You have no shell in this deployment, but the file tools work.".to_string(),
         };
         let integrations = if servers.is_empty() {
             "No MCP servers are connected.".to_string()
@@ -392,11 +579,33 @@ impl Engine {
             )
         };
         let now = jiff::Zoned::now();
-        format!(
+        let mut prompt = format!(
             "{PROMPT}\n\n# This deployment\n\n- Now: {} ({}).\n- {computer}\n- {integrations}\n- Wiki pages: {pages}.",
             now.strftime("%A %Y-%m-%d %H:%M"),
             now.time_zone().iana_name().unwrap_or("local time"),
-        )
+        );
+        if let Some(listing) = self.skills.listing() {
+            prompt.push_str(&format!("\n\n# Skills\n\nRead a skill with skill_read before doing a task it covers.\n\n{listing}"));
+        }
+        if let Some(context) = &request.context {
+            prompt.push_str(&format!("\n\n# This conversation\n\n{context}"));
+        }
+        // Standing instructions for this channel, kept in the wiki so the
+        // teammate (or anyone) can change them by asking.
+        if let Some(target) = &request.target
+            && let Ok(page) = self.wiki.read(&format!("channels/{}", target.channel))
+        {
+            prompt.push_str(&format!(
+                "\n\n# Instructions for this channel (wiki page channels/{})\n\n{page}",
+                target.channel
+            ));
+        }
+        if let Some(instructions) = &self.instructions {
+            prompt.push_str(&format!(
+                "\n\n# Instructions from the people who run you\n\n{instructions}"
+            ));
+        }
+        prompt
     }
 
     fn path(&self, conversation: &str) -> PathBuf {
@@ -434,18 +643,25 @@ impl Engine {
     /// leaves a half transcript behind.
     fn save(&self, conversation: &str, saved: &Saved) -> Result<()> {
         let path = self.path(conversation);
-        let dir = path.parent().context("conversation path has no folder")?;
-        std::fs::create_dir_all(dir)?;
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec(saved)?)?;
-        std::fs::rename(&tmp, &path)?;
-        Ok(())
+        crate::write_atomic(&path, &serde_json::to_vec(saved)?)
     }
 }
 
+struct Outcome {
+    history: Vec<Entry>,
+    answer: Result<String>,
+    usage: Option<Usage>,
+    cancelled: bool,
+}
+
 enum Admit {
-    /// Start a task: its steering queue, the saved transcript, and the new messages.
-    Run(Steer, Vec<Entry>, Vec<Entry>),
+    /// Start a task with the saved transcript and the new messages.
+    Run {
+        steer: Steer,
+        cancel: Arc<Notify>,
+        saved: Saved,
+        fresh: Vec<Entry>,
+    },
     Steered,
     Wait,
     Nothing,
@@ -470,8 +686,8 @@ impl Drop for RunningGuard<'_> {
     }
 }
 
-/// The folder a conversation's sandboxed shell works in.
-fn workspace_dir(data_dir: &Path, conversation: &str) -> PathBuf {
+/// The folder a conversation's files and sandboxed shell work in.
+pub fn workspace_dir(data_dir: &Path, conversation: &str) -> PathBuf {
     data_dir
         .join("workspaces")
         .join(crate::safe_id(conversation))
@@ -494,7 +710,7 @@ fn describe_call(call: &ToolCall, title: Option<&str>) -> String {
 }
 
 /// The text of the model's last reply since the last message from a person.
-fn last_answer(history: &[Entry]) -> String {
+pub fn last_answer(history: &[Entry]) -> String {
     history
         .iter()
         .rev()
@@ -527,28 +743,8 @@ fn is_newer(cursor: Option<&str>, seen: Option<&str>) -> bool {
     }
 }
 
-/// Every tool call is allowed. The tools are safe by construction: the shell
-/// runs in a sandbox, web fetches cannot reach private networks, and MCP
-/// servers are ones the operator chose to connect.
-// ponytail: allow-all gate; per-tool approval buttons in Slack are the upgrade path.
-#[derive(Debug)]
-struct AllowAll;
-
-#[async_trait::async_trait]
-impl PermissionGate for AllowAll {
-    async fn ask(&self, request: &PermissionRequest) -> openslacktag_core::Result<Decision> {
-        // The one thing refused: a fourth identical call in a row. Nobody is
-        // watching to approve it, and repeating it again will not help.
-        if request.key == DOOM_LOOP_KEY {
-            return Ok(Decision::Deny);
-        }
-        Ok(Decision::Allow)
-    }
-
-    async fn verdict(&self, _key: &str, _target: &str) -> Action {
-        Action::Allow
-    }
-}
+const REFUSED: &str = "I stopped because a step I needed wasn't approved. Tell me how you'd like to go on, \
+or approve it next time I ask.";
 
 const PROMPT: &str = "\
 You are OpenSlackTag, an AI teammate that lives in the team's Slack. People tag you with tasks; you do them \
@@ -557,11 +753,14 @@ end to end with your tools and reply in the thread with the result.
 # How to work
 
 - Do the work that was asked, not a plan for it. If the request is clear enough to act on, act, then report.
-- Check facts with your tools instead of guessing. If something fails, say so plainly with the error; never claim \
-success you did not verify.
+- Check facts with your tools instead of guessing. Search the web when you need current information. If something \
+fails, say so plainly with the error; never claim success you did not verify.
 - Finish. If a task has four parts, do four. If one is blocked, do the rest and say which one and why.
+- Big jobs with independent parts (research several things, review several files) go faster with delegate, which \
+runs helpers in parallel.
 - If a request is ambiguous and a wrong guess would be costly, ask one short question instead.
 - People may add to a task while you work; their messages appear in the conversation. Take them into account.
+- Some tools need a person's approval. If one is refused, do not retry it; say what you could not do.
 
 # How to reply
 
@@ -569,15 +768,24 @@ success you did not verify.
 - Cite sources: link every URL you relied on, and name the wiki pages you used.
 - Format for Slack: *bold*, _italic_, `code`, ```code blocks```, bullet lists, <https://url|label> links. \
 No Markdown headings or tables.
-- Messages from people start with their id, like <@U123>: ... Mention people the same way.
+- Messages from people start with who wrote them, like <@U123> (Ana): ... Mention people as <@U123>.
+- To give someone a file (a report, a CSV, a chart), write it to your workspace and use share_file.
 
-# The team wiki is your long-term memory
+# Memory
 
-- Before answering anything about the team, its people, processes, decisions or projects, search the wiki.
+- The team wiki is your long-term memory. Before answering anything about the team, its people, processes, \
+decisions or projects, search it.
 - When you learn something durable (a decision, a process, who owns what, how a recurring task is done, a \
 correction), update the wiki: read the page, then write it back with the new fact merged in. Keep pages short and \
 organised by topic, e.g. team/people, processes/deploys, decisions/2026.
-- Never store secrets, passwords, tokens or sensitive personal data in the wiki.";
+- If someone asks you to always behave a certain way in a channel, write it to the wiki page channels/<channel id>; \
+it is added to your instructions there.
+- Never store secrets, passwords, tokens or sensitive personal data in the wiki.
+
+# Automating
+
+- When a request is clearly recurring (a daily summary, a weekly report, a check every morning), offer to schedule \
+it, and use schedule_task when they agree.";
 
 #[cfg(test)]
 mod tests {

@@ -14,7 +14,11 @@ use openslacktag_provider::{AnthropicProvider, OpenAiProvider, ProviderConfig, R
 use serde::Deserialize;
 
 use crate::engine::{Engine, Parts};
+use crate::permissions::load_rules;
+use crate::search::{SearchConfig, WebSearch};
+use crate::skills::Skills;
 use crate::tools::Sandbox;
+use openslacktag_core::tool::Tool;
 
 pub const ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com/v1";
 pub const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
@@ -44,6 +48,17 @@ pub struct Config {
     pub slack_api_url: String,
     /// Slack user ids allowed to use the teammate; empty means everyone in the workspace.
     pub allowed_users: Vec<String>,
+    /// Slack user ids who may approve `ask` tool calls; empty means whoever asked.
+    pub approvers: Vec<String>,
+    /// Allow / ask / deny rules for tools.
+    pub permissions: PathBuf,
+    /// Folders of Agent Skills (`<name>/SKILL.md`).
+    pub skills_dir: PathBuf,
+    /// Standing instructions added to every system prompt.
+    pub instructions: PathBuf,
+    pub search: Option<SearchConfig>,
+    /// Where weekly automation suggestions are posted, if anywhere.
+    pub suggestions_channel: Option<String>,
 }
 
 impl std::fmt::Debug for Config {
@@ -107,6 +122,23 @@ impl Config {
             allowed_users: var("ALLOWED_USERS")
                 .map(|v| parse_list(&v))
                 .unwrap_or_default(),
+            approvers: var("APPROVERS").map(|v| parse_list(&v)).unwrap_or_default(),
+            permissions: var("PERMISSIONS")
+                .unwrap_or_else(|| "permissions.json".into())
+                .into(),
+            skills_dir: var("SKILLS_DIR").unwrap_or_else(|| "skills".into()).into(),
+            instructions: var("INSTRUCTIONS")
+                .unwrap_or_else(|| "instructions.md".into())
+                .into(),
+            search: match var("SEARCH_PROVIDER") {
+                Some(provider) => Some(SearchConfig::new(
+                    &provider,
+                    var("SEARCH_API_KEY"),
+                    var("SEARCH_URL"),
+                )?),
+                None => None,
+            },
+            suggestions_channel: var("SUGGESTIONS_CHANNEL"),
         })
     }
 
@@ -163,6 +195,19 @@ impl Config {
                 Err(e) => tracing::warn!("MCP server {} failed to start: {e}", record.name),
             }
         }
+        let instructions = match std::fs::read_to_string(&self.instructions) {
+            Ok(text) if !text.trim().is_empty() => Some(text),
+            Ok(_) => None,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("could not read {}", self.instructions.display()));
+            }
+        };
+        let mut extra_tools: Vec<Arc<dyn Tool>> = Vec::new();
+        if let Some(search) = &self.search {
+            extra_tools.push(Arc::new(WebSearch::new(search.clone())));
+        }
         Engine::new(Parts {
             provider: self.provider(),
             model: self.model()?.to_string(),
@@ -170,7 +215,10 @@ impl Config {
             sandbox: self.sandbox(),
             mcp,
             compact_at_tokens: self.compact_at_tokens,
-            extra_tools: Vec::new(),
+            rules: load_rules(&self.permissions)?,
+            skills: Skills::load(&self.skills_dir)?,
+            instructions,
+            extra_tools,
         })
     }
 

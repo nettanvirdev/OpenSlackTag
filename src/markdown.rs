@@ -23,7 +23,7 @@ pub fn to_mrkdwn(md: &str) -> String {
 /// `<#C…>` and web links `<https://…|label>`. Everything else is shown as
 /// text. In particular `<!channel>`, `<!here>` and `<!subteam^…>` never
 /// notify anyone, even if a fetched page talks the model into writing them.
-fn escape(text: &str) -> String {
+pub fn escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(i) = rest.find(['&', '<', '>']) {

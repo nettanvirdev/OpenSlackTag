@@ -70,6 +70,9 @@ pub struct PermissionRequest {
     /// What `target` is made of, when it is more than one action. Every part
     /// of a chained shell line needs a rule of its own.
     pub shape: Shape,
+    /// What a person approving the call should see beyond the target, such as
+    /// an MCP call's arguments. Display only; rules never match on it.
+    pub detail: Option<String>,
 }
 
 impl PermissionRequest {
@@ -79,7 +82,13 @@ impl PermissionRequest {
             target: target.into(),
             always: None,
             shape: Shape::Whole,
+            detail: None,
         }
+    }
+
+    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
     }
 
     pub fn with_always(mut self, always: impl Into<String>) -> Self {

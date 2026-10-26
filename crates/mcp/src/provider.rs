@@ -146,12 +146,14 @@ impl Tool for McpTool {
         ToolSource::Mcp
     }
 
-    fn permission(&self, _args: &Value) -> PermissionRequest {
+    fn permission(&self, args: &Value) -> PermissionRequest {
         // Keyed on `mcp` with the tool as the target, so a rule can name one
         // tool (`github_create_issue`), a whole server (`github_*`), or every
         // MCP tool at once - all with the same glob syntax used everywhere
-        // else.
-        PermissionRequest::new("mcp", self.id.clone()).with_always(self.id.clone())
+        // else. The arguments go along for whoever is asked to approve.
+        PermissionRequest::new("mcp", self.id.clone())
+            .with_always(self.id.clone())
+            .with_detail(args.to_string())
     }
 
     fn render(&self, _args: &Value) -> Option<String> {

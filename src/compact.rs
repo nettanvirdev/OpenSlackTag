@@ -4,10 +4,9 @@
 
 use std::collections::HashSet;
 
-use futures::StreamExt;
 use openslacktag_core::Provider;
 use openslacktag_core::message::{Entry, UserEntry};
-use openslacktag_core::provider::{ChatRequest, StreamEvent};
+use openslacktag_core::provider::ChatRequest;
 
 /// Entries kept verbatim at the end when they fit in half the budget.
 const KEEP_RECENT: usize = 8;
@@ -152,15 +151,7 @@ pub async fn compact(
         temperature: Some(0.0),
         ..Default::default()
     };
-    let mut stream = provider.stream_chat(request);
-    let mut summary = String::new();
-    while let Some(event) = stream.next().await {
-        match event {
-            StreamEvent::Delta { text } => summary.push_str(&text),
-            StreamEvent::Error { message, .. } => return Err(message),
-            _ => {}
-        }
-    }
+    let summary = crate::complete_text(provider, request).await?;
     let summary = summary.trim();
     if summary.is_empty() {
         return Err("the model returned an empty summary".into());
