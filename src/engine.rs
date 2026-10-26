@@ -15,7 +15,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use openslacktag_agent::{Agent, AgentConfig, AgentEvent, Steer, StopReason, Turn};
-use openslacktag_core::message::{Entry, ToolCall};
+use openslacktag_core::message::Entry;
 use openslacktag_core::permission::Rule;
 use openslacktag_core::provider::Usage;
 use openslacktag_core::tool::{PermissionGate, Tool, ToolRegistry};
@@ -43,6 +43,15 @@ pub struct Incoming {
     pub entry: Entry,
 }
 
+/// Progress while a task runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Progress {
+    /// What is happening right now, e.g. "Reading #general".
+    Doing(String),
+    /// A finished step, for the summary under the answer, e.g. "Read #general".
+    Done(String),
+}
+
 /// Where a conversation's replies go, for tools that post or schedule.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Target {
@@ -56,8 +65,8 @@ pub struct Target {
 pub struct Request<'a> {
     pub conversation: &'a str,
     pub incoming: Vec<Incoming>,
-    /// Short progress notes ("Using web_fetch: …") while the work runs.
-    pub progress: &'a UnboundedSender<String>,
+    /// What is happening ("Reading #general") and what got done, as the work runs.
+    pub progress: &'a UnboundedSender<Progress>,
     /// Who answers `ask` permission rules.
     pub approver: Arc<dyn Approver>,
     /// Where replies go; enables scheduling and posting tools.
@@ -438,7 +447,9 @@ impl Engine {
     ) -> Result<Outcome> {
         history.extend(fresh);
         if compact::estimate_tokens(&history) > self.compact_at_tokens {
-            let _ = request.progress.send("Compacting the conversation".into());
+            let _ = request
+                .progress
+                .send(Progress::Doing("Compacting the conversation".into()));
             match compact::compact(
                 self.provider.as_ref(),
                 &self.config.model,
@@ -491,14 +502,43 @@ impl Engine {
 
         let mut events = agent.run(turn);
         let mut done = None;
+        // Each call's finished label and arguments, until its result comes back.
+        let mut finishing: HashMap<String, (String, String)> = HashMap::new();
         let mut cancelled = false;
         loop {
             tokio::select! {
                 event = events.next() => {
                     let Some(event) = event else { break };
                     match event {
-                        AgentEvent::ToolStarted { call, title } => {
-                            let _ = request.progress.send(describe_call(&call, title.as_deref()));
+                        AgentEvent::ToolStarted { call, .. } => {
+                            let step = crate::steps::label(&call.name, &call.parsed_arguments());
+                            let _ = request.progress.send(Progress::Doing(step.doing));
+                            finishing.insert(call.id.to_string(), (step.done, call.arguments.clone()));
+                        }
+                        AgentEvent::ToolFinished { result } => {
+                            if let Some((done, args)) = finishing.remove(&result.call_id.to_string()) {
+                                let outcome = if result.was_denied() {
+                                    "denied"
+                                } else if result.ok {
+                                    "ok"
+                                } else {
+                                    "failed"
+                                };
+                                crate::audit::record(&self.data_dir, &crate::audit::Line {
+                                    at: jiff::Timestamp::now().to_string(),
+                                    conversation: request.conversation.to_string(),
+                                    requester: request.requester.clone(),
+                                    tool: result.tool.clone(),
+                                    args,
+                                    outcome: outcome.into(),
+                                });
+                                let done = match outcome {
+                                    "denied" => format!("{done} (not approved)"),
+                                    "failed" => format!("{done} (failed)"),
+                                    _ => done,
+                                };
+                                let _ = request.progress.send(Progress::Done(done));
+                            }
                         }
                         AgentEvent::Notice { message } => tracing::info!("{message}"),
                         AgentEvent::Done { stopped, history, usage } => done = Some((stopped, history, usage)),
@@ -693,22 +733,6 @@ pub fn workspace_dir(data_dir: &Path, conversation: &str) -> PathBuf {
         .join(crate::safe_id(conversation))
 }
 
-/// "Using web_fetch: https://…" for the progress note. The detail is the
-/// call's title if it has one, else its first string argument (a URL, a page,
-/// a query), which reads well for MCP tools too.
-fn describe_call(call: &ToolCall, title: Option<&str>) -> String {
-    let args = call.parsed_arguments();
-    let detail = title.map(str::to_string).or_else(|| {
-        args.as_object()?
-            .values()
-            .find_map(|v| v.as_str().map(|s| crate::one_line(s, 80)))
-    });
-    match detail {
-        Some(detail) if !detail.is_empty() => format!("Using {}: {detail}", call.name),
-        _ => format!("Using {}", call.name),
-    }
-}
-
 /// The text of the model's last reply since the last message from a person.
 pub fn last_answer(history: &[Entry]) -> String {
     history
@@ -804,25 +828,6 @@ mod tests {
         assert!(!is_newer(Some("1.0"), Some("1.0")));
         assert!(is_newer(None, Some("5.0")));
         assert!(is_newer(Some("1.0"), None));
-    }
-
-    #[test]
-    fn progress_notes_name_the_tool_and_its_target() {
-        let call = |args: &str| ToolCall {
-            id: "c".into(),
-            name: "web_fetch".into(),
-            arguments: args.into(),
-        };
-        assert_eq!(
-            describe_call(&call(r#"{"url":"https://a.b"}"#), None),
-            "Using web_fetch: https://a.b"
-        );
-        assert_eq!(describe_call(&call("{}"), None), "Using web_fetch");
-        assert_eq!(describe_call(&call("not json"), None), "Using web_fetch");
-        assert_eq!(
-            describe_call(&call("{}"), Some("Title")),
-            "Using web_fetch: Title"
-        );
     }
 
     #[test]

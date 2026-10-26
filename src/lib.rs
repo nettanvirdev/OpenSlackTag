@@ -2,11 +2,13 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod audit;
 pub mod compact;
 pub mod config;
 pub mod delegate;
 pub mod engine;
 pub mod files;
+pub mod images;
 pub mod markdown;
 pub mod permissions;
 pub mod schedule;
@@ -15,6 +17,7 @@ pub mod setup;
 pub mod skills;
 pub mod slack;
 pub mod slack_tools;
+pub mod steps;
 pub mod suggest;
 pub mod tools;
 pub mod usage;

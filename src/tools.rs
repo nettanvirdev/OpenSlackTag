@@ -18,6 +18,10 @@ use tokio::process::Command;
 
 const MAX_FETCH_BYTES: usize = 2_000_000;
 const MAX_WIKI_PAGE_BYTES: usize = 100_000;
+/// Earlier versions kept per wiki page, and where they and the change log live.
+const MAX_VERSIONS: usize = 20;
+const VERSIONS: &str = ".versions";
+const CHANGES: &str = ".changes.jsonl";
 const SHELL_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Where the sandboxed shell runs: a Docker image and its network mode.
@@ -25,6 +29,23 @@ const SHELL_TIMEOUT: Duration = Duration::from_secs(120);
 pub struct Sandbox {
     pub image: String,
     pub network: String,
+    /// When OpenSlackTag itself runs in a container, sandbox containers are
+    /// started by the host's Docker and need host paths: (this process's
+    /// data folder, the same folder's path on the host).
+    pub host_data_dir: Option<(PathBuf, PathBuf)>,
+}
+
+impl Sandbox {
+    /// The path to give `docker run -v` for a workspace folder.
+    fn mount_source(&self, workspace: &Path) -> PathBuf {
+        match &self.host_data_dir {
+            Some((data, host)) => match workspace.strip_prefix(data) {
+                Ok(rest) => host.join(rest),
+                Err(_) => workspace.to_path_buf(),
+            },
+            None => workspace.to_path_buf(),
+        }
+    }
 }
 
 /// The team wiki: Markdown pages in a folder, the teammate's long-term memory.
@@ -84,7 +105,9 @@ impl Wiki {
         })
     }
 
-    pub fn write(&self, page: &str, content: &str) -> Result<()> {
+    /// Save a page. The version it replaces is kept (the last
+    /// `MAX_VERSIONS` per page) and the change is logged with who made it.
+    pub fn write(&self, page: &str, content: &str, by: &str) -> Result<()> {
         if content.len() > MAX_WIKI_PAGE_BYTES {
             return Err(Error::InvalidInput(format!(
                 "page too large ({} bytes, max {MAX_WIKI_PAGE_BYTES}); split it into smaller pages",
@@ -92,11 +115,90 @@ impl Wiki {
             )));
         }
         let path = self.path(page)?;
+        let page = page.trim().trim_end_matches(".md");
+        let mut previous = None;
+        if let Ok(old) = std::fs::read_to_string(&path) {
+            if old == content {
+                return Ok(());
+            }
+            let version = jiff::Timestamp::now()
+                .strftime("%Y%m%dT%H%M%S%3fZ")
+                .to_string();
+            let dir = self.dir.join(VERSIONS).join(page);
+            std::fs::create_dir_all(&dir)?;
+            std::fs::write(dir.join(format!("{version}.md")), old)?;
+            prune_versions(&dir);
+            previous = Some(version);
+        }
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(path, content)?;
+        let change = json!({
+            "at": jiff::Timestamp::now().to_string(),
+            "page": page,
+            "by": by,
+            "bytes": content.len(),
+            "previous": previous,
+        });
+        let mut log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.dir.join(CHANGES))?;
+        std::io::Write::write_all(&mut log, format!("{change}\n").as_bytes())?;
         Ok(())
+    }
+
+    /// Recent changes, newest first, for one page or the whole wiki.
+    pub fn history(&self, page: Option<&str>) -> Result<String> {
+        let page = page.map(|p| p.trim().trim_end_matches(".md"));
+        let text = std::fs::read_to_string(self.dir.join(CHANGES)).unwrap_or_default();
+        let lines: Vec<String> = text
+            .lines()
+            .rev()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter(|c| page.is_none_or(|p| c["page"] == p))
+            .take(30)
+            .map(|c| {
+                let previous = c["previous"]
+                    .as_str()
+                    .map(|v| format!(", previous version {v}"))
+                    .unwrap_or_else(|| ", new page".into());
+                format!(
+                    "{} {} by {} ({} bytes{previous})",
+                    c["at"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .chars()
+                        .take(16)
+                        .collect::<String>(),
+                    c["page"].as_str().unwrap_or_default(),
+                    c["by"].as_str().unwrap_or("?"),
+                    c["bytes"],
+                )
+            })
+            .collect();
+        Ok(if lines.is_empty() {
+            "No changes recorded.".into()
+        } else {
+            lines.join("\n")
+        })
+    }
+
+    /// An earlier version of a page, by the name `history` shows.
+    pub fn read_version(&self, page: &str, version: &str) -> Result<String> {
+        self.path(page)?;
+        if !version.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return Err(Error::InvalidInput("not a version name".into()));
+        }
+        let page = page.trim().trim_end_matches(".md");
+        std::fs::read_to_string(
+            self.dir
+                .join(VERSIONS)
+                .join(page)
+                .join(format!("{version}.md")),
+        )
+        .map_err(|_| Error::not_found("wiki version", format!("{page} {version}")))
     }
 
     /// Lines ranked by how many query words they (or their page name) contain.
@@ -140,6 +242,7 @@ enum Kind {
     WikiSearch,
     WikiRead,
     WikiWrite,
+    WikiHistory,
     Shell,
 }
 
@@ -161,6 +264,7 @@ pub fn builtin_tools(wiki: &Arc<Wiki>, sandbox: Option<&Sandbox>) -> Vec<Arc<dyn
         Kind::WikiSearch,
         Kind::WikiRead,
         Kind::WikiWrite,
+        Kind::WikiHistory,
     ];
     if sandbox.is_some() {
         kinds.push(Kind::Shell);
@@ -189,7 +293,14 @@ fn describe(kind: Kind, sandbox: Option<&Sandbox>) -> String {
         Kind::WikiSearch => {
             "Search the team wiki. Returns matching lines as page:line: text.".into()
         }
-        Kind::WikiRead => "Read one wiki page.".into(),
+        Kind::WikiRead => {
+            "Read one wiki page, or an earlier version of it (versions are listed by wiki_history).".into()
+        }
+        Kind::WikiHistory => {
+            "Recent wiki changes (who changed which page, when), for one page or all. To undo a change, read \
+             the earlier version and write it back."
+                .into()
+        }
         Kind::WikiWrite => {
             "Create or fully replace a wiki page with Markdown. Read the page first if it exists, \
                             so you keep what is still true."
@@ -217,6 +328,7 @@ impl Tool for Builtin {
             Kind::WikiSearch => "wiki_search",
             Kind::WikiRead => "wiki_read",
             Kind::WikiWrite => "wiki_write",
+            Kind::WikiHistory => "wiki_history",
             Kind::Shell => "run_shell",
         }
     }
@@ -234,8 +346,15 @@ impl Tool for Builtin {
             Kind::WikiList => (json!({}), vec![]),
             Kind::WikiSearch => (json!({"query": {"type": "string"}}), vec!["query"]),
             Kind::WikiRead => (
-                json!({"page": {"type": "string", "description": "Page name, e.g. team/standup"}}),
+                json!({
+                    "page": {"type": "string", "description": "Page name, e.g. team/standup"},
+                    "version": {"type": "string", "description": "Optional: an earlier version from wiki_history"}
+                }),
                 vec!["page"],
+            ),
+            Kind::WikiHistory => (
+                json!({"page": {"type": "string", "description": "Optional: one page"}}),
+                vec![],
             ),
             Kind::WikiWrite => (
                 json!({
@@ -261,7 +380,7 @@ impl Tool for Builtin {
             Kind::WebFetch => str_arg(args, "url").unwrap_or("*"),
             Kind::WikiRead | Kind::WikiWrite => str_arg(args, "page").unwrap_or("*"),
             Kind::Shell => str_arg(args, "command").unwrap_or("*"),
-            Kind::WikiList | Kind::WikiSearch => "*",
+            Kind::WikiList | Kind::WikiSearch | Kind::WikiHistory => "*",
         };
         PermissionRequest::new(self.id(), target)
     }
@@ -272,7 +391,7 @@ impl Tool for Builtin {
             Kind::WikiSearch => str_arg(args, "query"),
             Kind::WikiRead | Kind::WikiWrite => str_arg(args, "page"),
             Kind::Shell => str_arg(args, "command"),
-            Kind::WikiList => None,
+            Kind::WikiList | Kind::WikiHistory => None,
         }?;
         Some(crate::one_line(detail, 80))
     }
@@ -289,12 +408,22 @@ impl Tool for Builtin {
                 }
             }
             Kind::WikiSearch => self.wiki.search(required(&args, "query")?)?,
-            Kind::WikiRead => self.wiki.read(required(&args, "page")?)?,
+            Kind::WikiRead => match str_arg(&args, "version") {
+                Some(version) => self.wiki.read_version(required(&args, "page")?, version)?,
+                None => self.wiki.read(required(&args, "page")?)?,
+            },
             Kind::WikiWrite => {
                 let (page, content) = (required(&args, "page")?, required(&args, "content")?);
-                self.wiki.write(page, content)?;
+                // The workspace folder is named after the conversation.
+                let by = ctx
+                    .root
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                self.wiki.write(page, content, &by)?;
                 format!("Saved wiki page {page} ({} bytes).", content.len())
             }
+            Kind::WikiHistory => self.wiki.history(str_arg(&args, "page"))?,
             Kind::Shell => {
                 let sandbox = self
                     .sandbox
@@ -304,6 +433,19 @@ impl Tool for Builtin {
             }
         };
         Ok(ToolOutcome::text(output))
+    }
+}
+
+/// Keep only the newest `MAX_VERSIONS` files in a page's version folder.
+fn prune_versions(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut names: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    names.sort();
+    let excess = names.len().saturating_sub(MAX_VERSIONS);
+    for old in names.into_iter().take(excess) {
+        let _ = std::fs::remove_file(old);
     }
 }
 
@@ -319,6 +461,12 @@ fn required<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
 fn collect_markdown(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let path = entry?.path();
+        let hidden = path
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with('.'));
+        if hidden {
+            continue;
+        }
         if path.is_dir() {
             collect_markdown(&path, out)?;
         } else if path.extension().is_some_and(|e| e == "md") {
@@ -355,7 +503,10 @@ async fn run_shell(sandbox: &Sandbox, workspace: &Path, command: &str) -> Result
     .args(["--cap-drop", "ALL", "--security-opt", "no-new-privileges"])
     .args(["-e", "HOME=/work"])
     .arg("-v")
-    .arg(format!("{}:/work", workspace.display()));
+    .arg(format!(
+        "{}:/work",
+        sandbox.mount_source(&workspace).display()
+    ));
     // On Linux, run as the owner of the workspace rather than root, so files
     // the sandbox creates on the host are the bot's, never root-owned (and
     // never a setuid-root binary). Docker Desktop maps ownership itself.
@@ -617,8 +768,12 @@ mod tests {
     #[test]
     fn wiki_write_list_read_search() {
         let (wiki, _dir) = wiki();
-        wiki.write("team/standup", "# Standup\nDaily at 10am in #general.")
-            .unwrap();
+        wiki.write(
+            "team/standup",
+            "# Standup\nDaily at 10am in #general.",
+            "C1-1",
+        )
+        .unwrap();
         assert_eq!(wiki.pages().unwrap(), vec!["team/standup"]);
         assert!(wiki.read("team/standup.md").unwrap().contains("10am"));
         assert!(
@@ -634,9 +789,46 @@ mod tests {
         assert_eq!(wiki.pages().unwrap(), vec!["team/standup"]);
         assert!(wiki.search("standup").is_ok());
         assert!(matches!(
-            wiki.write("big", &"x".repeat(MAX_WIKI_PAGE_BYTES + 1)),
+            wiki.write("big", &"x".repeat(MAX_WIKI_PAGE_BYTES + 1), "c"),
             Err(Error::InvalidInput(_))
         ));
+    }
+
+    #[test]
+    fn changes_keep_history_and_old_versions() {
+        let (wiki, _dir) = wiki();
+        wiki.write("team/people", "Ana: PM", "C1-1").unwrap();
+        wiki.write("team/people", "Ana: PM\nBo: eng", "C1-2")
+            .unwrap();
+        wiki.write("team/people", "Ana: PM\nBo: eng", "C1-3")
+            .unwrap(); // unchanged: not logged
+        let history = wiki.history(Some("team/people")).unwrap();
+        let lines: Vec<&str> = history.lines().collect();
+        assert_eq!(lines.len(), 2, "{history}");
+        assert!(lines[0].contains("by C1-2") && lines[0].contains("previous version"));
+        assert!(lines[1].contains("new page"));
+        let version = lines[0]
+            .rsplit("previous version ")
+            .next()
+            .unwrap()
+            .trim_end_matches(')');
+        assert_eq!(
+            wiki.read_version("team/people", version).unwrap(),
+            "Ana: PM"
+        );
+        assert!(wiki.read_version("team/people", "../../x").is_err());
+        assert_eq!(
+            wiki.pages().unwrap(),
+            vec!["team/people"],
+            "history files are not pages"
+        );
+        for i in 0..(MAX_VERSIONS + 5) {
+            wiki.write("team/people", &format!("v{i}"), "c").unwrap();
+        }
+        let kept = std::fs::read_dir(wiki.dir.join(VERSIONS).join("team/people"))
+            .unwrap()
+            .count();
+        assert_eq!(kept, MAX_VERSIONS);
     }
 
     #[test]
@@ -647,6 +839,7 @@ mod tests {
         let with = builtin_tools(
             &wiki,
             Some(&Sandbox {
+                host_data_dir: None,
                 image: "alpine:3".into(),
                 network: "none".into(),
             }),
@@ -654,6 +847,23 @@ mod tests {
         let shell = tool(&with, "run_shell");
         assert!(shell.description().contains("alpine:3"));
         assert_eq!(shell.permission(&json!({"command": "ls"})).target, "ls");
+    }
+
+    #[test]
+    fn mounts_use_host_paths_when_running_in_a_container() {
+        let sandbox = Sandbox {
+            image: "x".into(),
+            network: "none".into(),
+            host_data_dir: Some(("/srv/data".into(), "/home/me/bot/data".into())),
+        };
+        assert_eq!(
+            sandbox.mount_source(Path::new("/srv/data/workspaces/C1-1")),
+            PathBuf::from("/home/me/bot/data/workspaces/C1-1")
+        );
+        assert_eq!(
+            sandbox.mount_source(Path::new("/elsewhere/w")),
+            PathBuf::from("/elsewhere/w")
+        );
     }
 
     #[test]

@@ -14,6 +14,7 @@ use openslacktag_provider::{AnthropicProvider, OpenAiProvider, ProviderConfig, R
 use serde::Deserialize;
 
 use crate::engine::{Engine, Parts};
+use crate::images::{GenerateImage, ImageConfig};
 use crate::permissions::load_rules;
 use crate::search::{SearchConfig, WebSearch};
 use crate::skills::Skills;
@@ -42,6 +43,8 @@ pub struct Config {
     pub mcp_config: PathBuf,
     pub sandbox_image: Option<String>,
     pub sandbox_network: String,
+    /// The data folder's path on the Docker host, when running in a container.
+    pub sandbox_host_data_dir: Option<PathBuf>,
     pub compact_at_tokens: usize,
     pub slack_bot_token: Option<String>,
     pub slack_app_token: Option<String>,
@@ -57,6 +60,8 @@ pub struct Config {
     /// Standing instructions added to every system prompt.
     pub instructions: PathBuf,
     pub search: Option<SearchConfig>,
+    /// Image generation, when IMAGE_MODEL is set.
+    pub images: Option<ImageConfig>,
     /// Where weekly automation suggestions are posted, if anywhere.
     pub suggestions_channel: Option<String>,
 }
@@ -106,7 +111,7 @@ impl Config {
         };
         Ok(Self {
             protocol,
-            llm_base_url: base.unwrap_or_else(|| default_base.into()),
+            llm_base_url: base.clone().unwrap_or_else(|| default_base.into()),
             llm_api_key: var("LLM_API_KEY"),
             llm_model: var("LLM_MODEL"),
             data_dir: var("DATA_DIR").unwrap_or_else(|| "data".into()).into(),
@@ -115,6 +120,7 @@ impl Config {
                 .into(),
             sandbox_image: var("SANDBOX_IMAGE"),
             sandbox_network,
+            sandbox_host_data_dir: var("SANDBOX_HOST_DATA_DIR").map(PathBuf::from),
             compact_at_tokens,
             slack_bot_token: var("SLACK_BOT_TOKEN"),
             slack_app_token: var("SLACK_APP_TOKEN"),
@@ -139,6 +145,18 @@ impl Config {
                 None => None,
             },
             suggestions_channel: var("SUGGESTIONS_CHANNEL"),
+            images: var("IMAGE_MODEL").map(|model| ImageConfig {
+                // Same provider as the chat model by default, if it is OpenAI-compatible.
+                base_url: var("IMAGE_BASE_URL").unwrap_or_else(|| match protocol {
+                    Protocol::OpenAi => base.clone().unwrap_or_else(|| OPENAI_BASE_URL.into()),
+                    Protocol::Anthropic => OPENAI_BASE_URL.into(),
+                }),
+                api_key: var("IMAGE_API_KEY").or_else(|| match protocol {
+                    Protocol::OpenAi => var("LLM_API_KEY"),
+                    Protocol::Anthropic => None,
+                }),
+                model,
+            }),
         })
     }
 
@@ -167,9 +185,15 @@ impl Config {
     }
 
     pub fn sandbox(&self) -> Option<Sandbox> {
+        let host_data_dir = self.sandbox_host_data_dir.clone().map(|host| {
+            let data =
+                std::path::absolute(&self.data_dir).unwrap_or_else(|_| self.data_dir.clone());
+            (data, host)
+        });
         self.sandbox_image.clone().map(|image| Sandbox {
             image,
             network: self.sandbox_network.clone(),
+            host_data_dir,
         })
     }
 
@@ -207,6 +231,9 @@ impl Config {
         let mut extra_tools: Vec<Arc<dyn Tool>> = Vec::new();
         if let Some(search) = &self.search {
             extra_tools.push(Arc::new(WebSearch::new(search.clone())));
+        }
+        if let Some(images) = &self.images {
+            extra_tools.push(Arc::new(GenerateImage::new(images.clone())));
         }
         Engine::new(Parts {
             provider: self.provider(),

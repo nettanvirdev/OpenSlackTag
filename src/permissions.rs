@@ -18,6 +18,8 @@ use parking_lot::Mutex;
 use serde::Deserialize;
 use tokio::sync::mpsc::UnboundedSender;
 
+use crate::engine::Progress;
+
 /// A tool call waiting for someone's yes or no.
 #[derive(Debug, Clone)]
 pub struct Approval {
@@ -61,6 +63,7 @@ pub fn default_rules() -> Vec<Rule> {
         "list_files",
         "share_file",
         "delegate",
+        "generate_image",
         "skill_read",
         "schedule_*",
         "slack_read_*",
@@ -109,7 +112,7 @@ pub struct Gate {
     /// "Always, in this conversation" approvals; saved with the transcript.
     session: Arc<Mutex<Vec<Rule>>>,
     approver: Arc<dyn Approver>,
-    progress: Option<UnboundedSender<String>>,
+    progress: Option<UnboundedSender<Progress>>,
 }
 
 impl Gate {
@@ -117,7 +120,7 @@ impl Gate {
         rules: Vec<Rule>,
         session: Arc<Mutex<Vec<Rule>>>,
         approver: Arc<dyn Approver>,
-        progress: Option<UnboundedSender<String>>,
+        progress: Option<UnboundedSender<Progress>>,
     ) -> Self {
         Self {
             rules,
@@ -146,10 +149,10 @@ impl PermissionGate for Gate {
             Action::Deny => Ok(Decision::Deny),
             Action::Ask => {
                 if let Some(progress) = &self.progress {
-                    let _ = progress.send(format!(
-                        "Waiting for approval to use {}: {}",
-                        request.key, request.target
-                    ));
+                    let _ = progress.send(Progress::Doing(format!(
+                        "Waiting for approval to use {}",
+                        request.key
+                    )));
                 }
                 let approval = Approval {
                     tool: request.key.clone(),

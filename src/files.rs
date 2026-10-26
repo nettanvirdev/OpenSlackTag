@@ -33,6 +33,52 @@ pub fn resolve(root: &Path, relative: &str) -> Result<PathBuf> {
     Ok(root.join(path))
 }
 
+const MAX_ZIP_ENTRIES: usize = 500;
+const MAX_ZIP_BYTES: u64 = 200_000_000;
+
+/// Unpack `archive` into `dest`, returning the files written (relative to
+/// `dest`). Entries that would land outside `dest` are skipped, and the
+/// counts and sizes are capped so a zip bomb stays harmless.
+pub fn extract_zip(archive: &Path, dest: &Path) -> anyhow::Result<Vec<String>> {
+    let mut zip = zip::ZipArchive::new(std::fs::File::open(archive)?)?;
+    if zip.len() > MAX_ZIP_ENTRIES {
+        anyhow::bail!(
+            "the archive has {} entries; the limit is {MAX_ZIP_ENTRIES}",
+            zip.len()
+        );
+    }
+    let mut written = Vec::new();
+    let mut total: u64 = 0;
+    for i in 0..zip.len() {
+        let mut entry = zip.by_index(i)?;
+        let Some(name) = entry.enclosed_name() else {
+            continue;
+        };
+        if entry.is_dir() {
+            continue;
+        }
+        total += entry.size();
+        if total > MAX_ZIP_BYTES {
+            anyhow::bail!(
+                "the archive unpacks to more than {} MB",
+                MAX_ZIP_BYTES / 1_000_000
+            );
+        }
+        let path = dest.join(&name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut out = std::fs::File::create(&path)?;
+        // Copy at most what the header promised, in case it lied.
+        std::io::copy(
+            &mut std::io::Read::take(&mut entry, MAX_ZIP_BYTES),
+            &mut out,
+        )?;
+        written.push(name.to_string_lossy().replace('\\', "/"));
+    }
+    Ok(written)
+}
+
 #[derive(Debug, Clone, Copy)]
 enum Op {
     Read,
@@ -215,6 +261,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(read.output, "# Q3");
+    }
+
+    #[test]
+    fn zips_unpack_safely() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.zip");
+        {
+            let mut zip = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+            let options = zip::write::SimpleFileOptions::default();
+            zip.start_file("docs/readme.txt", options).unwrap();
+            std::io::Write::write_all(&mut zip, b"hello").unwrap();
+            zip.start_file("../escape.txt", options).unwrap();
+            std::io::Write::write_all(&mut zip, b"nope").unwrap();
+            zip.finish().unwrap();
+        }
+        let dest = dir.path().join("out");
+        let files = extract_zip(&archive, &dest).unwrap();
+        assert_eq!(files, vec!["docs/readme.txt"]);
+        assert_eq!(
+            std::fs::read_to_string(dest.join("docs/readme.txt")).unwrap(),
+            "hello"
+        );
+        assert!(!dir.path().join("escape.txt").exists());
     }
 
     #[tokio::test]

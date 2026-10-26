@@ -1,0 +1,10 @@
+{
+  "rules": [
+    { "tool": "mcp", "pattern": "github_list_*", "action": "allow" },
+    { "tool": "mcp", "pattern": "github_get_*", "action": "allow" },
+    { "tool": "mcp", "pattern": "github_delete_*", "action": "deny" },
+    { "tool": "run_shell", "pattern": "rm -rf *", "action": "deny" },
+    { "tool": "slack_post_message", "pattern": "C0123456789", "action": "allow" },
+    { "tool": "web_fetch", "pattern": "*", "action": "allow" }
+  ]
+}

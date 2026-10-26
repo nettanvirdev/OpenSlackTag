@@ -37,6 +37,7 @@ tracing-subscriber = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
 base64 = "0.22"
+zip = { version = "9.1.1", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 openslacktag-mock = { workspace = true }

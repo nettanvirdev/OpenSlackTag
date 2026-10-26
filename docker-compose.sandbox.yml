@@ -1,0 +1,26 @@
+# Adds the sandboxed shell (run_shell) to the Docker deployment.
+#
+# How it works: the teammate starts a fresh, locked-down container for every
+# command it runs (no network by default, 1 CPU, 1 GB, no capabilities). To
+# do that it needs the host's Docker socket.
+#
+# The trade-off: a process with the Docker socket can control the host's
+# Docker, which is root-equivalent on the host. OpenSlackTag only uses it to
+# start sandbox containers, but run this on a machine dedicated to it, not on
+# one with other things you care about.
+#
+#   docker build -t openslacktag-sandbox sandbox/     # once: the sandbox image
+#   docker compose -f docker-compose.yml -f docker-compose.sandbox.yml up -d
+
+services:
+  openslacktag:
+    # Root inside the container, to use the mounted socket without matching
+    # the host's docker group id.
+    user: root
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      SANDBOX_IMAGE: ${SANDBOX_IMAGE:-openslacktag-sandbox}
+      # Sandbox containers are started by the host's Docker, so they need the
+      # host's path to the data folder, not this container's.
+      SANDBOX_HOST_DATA_DIR: ${PWD}/data

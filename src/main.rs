@@ -4,7 +4,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 use openslacktag::config::Config;
-use openslacktag::engine::{Incoming, Reply, Request};
+use openslacktag::engine::{Incoming, Progress, Reply, Request};
 use openslacktag::permissions::{Approval, Approver};
 use openslacktag::slack::Slack;
 use openslacktag_core::message::Entry;
@@ -23,6 +23,7 @@ Commands:
   doctor               Check the model, Slack, the sandbox, search and MCP servers
   schedules            List scheduled tasks (`schedules cancel <id>` to remove one)
   usage [days]         Token usage per day and model (default: 30 days)
+  audit [count]        The last tool calls: who asked, what ran, how it ended (default: 50)
   suggest [days]       Suggest automations from recent conversations (default: 7 days)
   help                 Show this help
 
@@ -62,6 +63,13 @@ async fn main() {
             Ok(())
         }),
         "suggest" => suggest(number(7)).await,
+        "audit" => Config::from_env().and_then(|config| {
+            println!(
+                "{}",
+                openslacktag::audit::tail(&config.data_dir, number(50) as usize)?
+            );
+            Ok(())
+        }),
         "help" | "--help" | "-h" => {
             println!("{HELP}");
             Ok(())
@@ -152,10 +160,12 @@ async fn chat() -> Result<()> {
                 continue;
             }
             text => {
-                let (progress, mut notes) = mpsc::unbounded_channel::<String>();
+                let (progress, mut notes) = mpsc::unbounded_channel::<Progress>();
                 let printer = tokio::spawn(async move {
                     while let Some(note) = notes.recv().await {
-                        println!("  … {}", openslacktag::one_line(&note, 120));
+                        if let Progress::Doing(note) = note {
+                            println!("  … {}", openslacktag::one_line(&note, 120));
+                        }
                     }
                 });
                 let reply = engine

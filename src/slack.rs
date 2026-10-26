@@ -22,13 +22,15 @@ use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-use crate::engine::{Engine, Incoming, Reply, Request, Target, workspace_dir};
+use crate::engine::{Engine, Incoming, Progress, Reply, Request, Target, workspace_dir};
 use crate::markdown::to_mrkdwn;
 use crate::permissions::{Approval, Approver};
-use crate::schedule::Schedule;
+use crate::schedule::{Schedule, Watch};
 use crate::slack_tools::slack_tools;
 
 const WORKING: &str = "_Working on it…_";
+/// What a channel trigger answers when a message needs nothing from it.
+const SKIP: &str = "SKIP";
 const STEERED: &str = "_Got it. I'm adding that to what I'm working on._";
 /// Slack takes longer messages, but splits anything past this badly.
 const MAX_MESSAGE_CHARS: usize = 3800;
@@ -54,6 +56,12 @@ const MAX_FILE_BYTES: u64 = 25_000_000;
 /// Images up to this size are also shown to the model directly.
 const MAX_IMAGE_BYTES: u64 = 5_000_000;
 /// Saying one of these (and only that) to a busy teammate stops its task.
+/// Answer text per Block Kit section (Slack's limit is 3000).
+const MAX_SECTION_CHARS: usize = 2900;
+/// Longer answers go out as plain messages instead (a message holds 50 blocks).
+const MAX_ANSWER_SECTIONS: usize = 40;
+/// Step lists kept for "Show steps" clicks.
+const MAX_REMEMBERED_STEPS: usize = 2000;
 const STOP_WORDS: &[&str] = &[
     "stop",
     "cancel",
@@ -79,6 +87,18 @@ pub struct Slack {
     names: Mutex<HashMap<String, String>>,
     /// Channel ids by name, for tools given `#general`.
     channel_ids: Mutex<HashMap<String, String>>,
+    /// The steps behind recent answers, for "Show steps".
+    steps: Mutex<HashMap<String, Vec<String>>>,
+    /// Where 👍 / 👎 clicks are recorded.
+    feedback_file: Mutex<Option<std::path::PathBuf>>,
+}
+
+/// What a task produced, for the message under the answer.
+struct TaskOutcome {
+    reply: Result<Reply>,
+    steps: Vec<String>,
+    seconds: u64,
+    model: String,
 }
 
 struct PendingApproval {
@@ -142,6 +162,8 @@ impl Slack {
             pending: Mutex::default(),
             names: Mutex::default(),
             channel_ids: Mutex::default(),
+            steps: Mutex::default(),
+            feedback_file: Mutex::default(),
         };
         let auth = slack
             .call("auth.test", &slack.bot_token, &[])
@@ -186,6 +208,7 @@ impl Slack {
         engine: Arc<Engine>,
         suggestions_channel: Option<String>,
     ) -> Result<()> {
+        *self.feedback_file.lock() = Some(engine.data_dir().join("feedback.jsonl"));
         let scheduler = tokio::spawn(self.clone().run_schedules(engine.clone()));
         let suggester = suggestions_channel
             .map(|channel| tokio::spawn(self.clone().run_suggestions(engine.clone(), channel)));
@@ -269,15 +292,112 @@ impl Slack {
     }
 
     fn dispatch(self: &Arc<Self>, payload: Option<&Value>, engine: &Arc<Engine>) {
-        let Some(event) = payload.and_then(|p| self.accept(p)) else {
+        let Some(payload) = payload else {
             return;
         };
-        let (slack, engine) = (self.clone(), engine.clone());
-        tokio::spawn(async move {
-            if let Err(e) = slack.handle(&engine, &event).await {
-                tracing::error!("Failed to answer message {}: {e:#}", event.ts);
-            }
-        });
+        if let Some(event) = self.accept(payload) {
+            let (slack, engine) = (self.clone(), engine.clone());
+            tokio::spawn(async move {
+                if let Err(e) = slack.handle(&engine, &event).await {
+                    tracing::error!("Failed to answer message {}: {e:#}", event.ts);
+                }
+            });
+            return;
+        }
+        let Some(event) = self.channel_message(payload) else {
+            return;
+        };
+        for watch in engine.schedules().triggered(&event.channel, &event.text) {
+            let (slack, engine, event) = (self.clone(), engine.clone(), event.clone());
+            tokio::spawn(async move {
+                if let Err(e) = slack.run_trigger(&engine, &watch, &event).await {
+                    tracing::error!("Trigger {} failed: {e:#}", watch.id);
+                }
+            });
+        }
+    }
+
+    /// A new top-level message from a person in a channel, which channel
+    /// triggers may want. Messages that mention the bot are left to the
+    /// mention handler.
+    fn channel_message(&self, payload: &Value) -> Option<Event> {
+        let event: Event = serde_json::from_value(payload.get("event")?.clone()).ok()?;
+        let user = event.user.as_deref()?;
+        let top_level = event.thread_ts.as_deref().is_none_or(|t| t == event.ts);
+        let person = event.bot_id.is_none()
+            && event
+                .subtype
+                .as_deref()
+                .is_none_or(|s| PERSON_SUBTYPES.contains(&s))
+            && user != self.bot_user_id;
+        let in_channel = event.kind == "message"
+            && matches!(event.channel_type.as_deref(), Some("channel" | "group"));
+        let mentions_us = event.text.contains(&format!("<@{}", self.bot_user_id));
+        let our_workspace = event
+            .user_team
+            .as_deref()
+            .is_none_or(|team| self.team_id.is_empty() || team == self.team_id);
+        if !(top_level
+            && person
+            && in_channel
+            && !mentions_us
+            && our_workspace
+            && self.is_allowed(user))
+        {
+            return None;
+        }
+        let key = payload["event_id"]
+            .as_str()
+            .map_or_else(|| format!("{}:{}", event.channel, event.ts), str::to_string);
+        self.seen.lock().insert(key).then_some(event)
+    }
+
+    /// Run a channel trigger on the message that set it off, in that
+    /// message's thread. A trigger that decides the message needs nothing
+    /// answers SKIP, and nothing is posted.
+    async fn run_trigger(
+        self: &Arc<Self>,
+        engine: &Engine,
+        watch: &Watch,
+        event: &Event,
+    ) -> Result<()> {
+        let conversation = format!("{}-{}", event.channel, event.ts);
+        let workspace = workspace_dir(engine.data_dir(), &conversation);
+        let incoming = self
+            .incoming(event, Some(&event.ts), false, None, &workspace)
+            .await?;
+        let placeholder = self.post(&event.channel, Some(&event.ts), WORKING).await?;
+        let by = watch
+            .created_by
+            .as_deref()
+            .map_or("someone".to_string(), |u| format!("<@{u}>"));
+        let context = format!(
+            "Routine `{id}`, set up by {by}, runs on new messages in <#{channel}>. Its instructions: \"{prompt}\". \
+             The message above set it off. Do what the routine says for this message and reply in its thread. If \
+             the message needs nothing from you, reply with exactly {SKIP}.",
+            id = watch.id,
+            channel = event.channel,
+            prompt = watch.prompt,
+        );
+        let target = Target {
+            channel: event.channel.clone(),
+            thread: Some(event.ts.clone()),
+        };
+        let outcome = self
+            .run_task(
+                engine,
+                &conversation,
+                incoming,
+                target.clone(),
+                watch.created_by.clone(),
+                context,
+                &placeholder,
+            )
+            .await;
+        if matches!(&outcome.reply, Ok(Reply::Answer(text)) if text.trim() == SKIP) {
+            return self.delete(&event.channel, &placeholder).await;
+        }
+        self.finish(&target, &placeholder, outcome).await
     }
 
     /// Keep mentions and DMs from people in this workspace (and on the
@@ -369,7 +489,7 @@ impl Slack {
                 ""
             },
         );
-        let reply = self
+        let outcome = self
             .run_task(
                 engine,
                 &conversation,
@@ -380,7 +500,7 @@ impl Slack {
                 &placeholder,
             )
             .await;
-        self.finish(&target, &placeholder, reply).await
+        self.finish(&target, &placeholder, outcome).await
     }
 
     /// Run one task with live progress in `placeholder`.
@@ -394,23 +514,34 @@ impl Slack {
         requester: Option<String>,
         context: String,
         placeholder: &str,
-    ) -> Result<Reply> {
-        let (progress, mut notes) = mpsc::unbounded_channel::<String>();
+    ) -> TaskOutcome {
+        let started = Instant::now();
+        let (progress, mut events) = mpsc::unbounded_channel::<Progress>();
+        let steps = Arc::new(Mutex::new(Vec::<String>::new()));
         let updater = {
-            let (slack, channel, ts) = (
+            let (slack, channel, ts, steps) = (
                 self.clone(),
                 target.channel.clone(),
                 placeholder.to_string(),
+                steps.clone(),
             );
             tokio::spawn(async move {
-                while let Some(mut note) = notes.recv().await {
-                    // Show only the latest note; older ones are already stale.
-                    while let Ok(newer) = notes.try_recv() {
-                        note = newer;
+                while let Some(first) = events.recv().await {
+                    // Show only the latest activity; older notes are already stale.
+                    let mut doing = None;
+                    let mut next = Some(first);
+                    while let Some(event) = next {
+                        match event {
+                            Progress::Doing(note) => doing = Some(note),
+                            Progress::Done(step) => steps.lock().push(step),
+                        }
+                        next = events.try_recv().ok();
                     }
-                    let text = format!("_{}…_", crate::one_line(&note, 150));
-                    let _ = slack.update(&channel, &ts, &text).await;
-                    tokio::time::sleep(PROGRESS_INTERVAL).await;
+                    if let Some(note) = doing {
+                        let text = format!("_{}…_", crate::one_line(&note, 150));
+                        let _ = slack.update(&channel, &ts, &text).await;
+                        tokio::time::sleep(PROGRESS_INTERVAL).await;
+                    }
                 }
             })
         };
@@ -435,15 +566,29 @@ impl Slack {
             .await;
         drop(progress);
         let _ = updater.await;
-        reply
+        let steps = steps.lock().clone();
+        TaskOutcome {
+            reply,
+            steps,
+            seconds: started.elapsed().as_secs(),
+            model: engine.model().to_string(),
+        }
     }
 
-    async fn finish(&self, target: &Target, placeholder: &str, reply: Result<Reply>) -> Result<()> {
+    async fn finish(&self, target: &Target, placeholder: &str, outcome: TaskOutcome) -> Result<()> {
         let (channel, thread) = (target.channel.as_str(), target.thread.as_deref());
-        match reply {
+        match outcome.reply {
             Ok(Reply::Answer(text)) => {
-                self.deliver(channel, thread, placeholder, &to_mrkdwn(&text))
-                    .await
+                let footer = format!("{} · {}s", outcome.model, outcome.seconds.max(1));
+                self.deliver_answer(
+                    channel,
+                    thread,
+                    placeholder,
+                    &to_mrkdwn(&text),
+                    &outcome.steps,
+                    &footer,
+                )
+                .await
             }
             Ok(Reply::Steered) => self.deliver(channel, thread, placeholder, STEERED).await,
             Ok(Reply::Nothing) => self.delete(channel, placeholder).await,
@@ -453,6 +598,73 @@ impl Slack {
                     .await
             }
         }
+    }
+
+    /// The answer, with what was done to get it, which model did it, and
+    /// feedback buttons, as one message (Block Kit). Answers too long for one
+    /// message fall back to plain text split across several.
+    async fn deliver_answer(
+        &self,
+        channel: &str,
+        thread: Option<&str>,
+        placeholder: &str,
+        text: &str,
+        steps: &[String],
+        footer: &str,
+    ) -> Result<()> {
+        let sections = split_message(text, MAX_SECTION_CHARS);
+        if sections.len() > MAX_ANSWER_SECTIONS {
+            return self.deliver(channel, thread, placeholder, text).await;
+        }
+        let key = uuid::Uuid::new_v4().simple().to_string();
+        let mut blocks: Vec<Value> = sections
+            .iter()
+            .map(|section| json!({"type": "section", "text": {"type": "mrkdwn", "text": section}}))
+            .collect();
+        let mut context = Vec::new();
+        if !steps.is_empty() {
+            let summary = format!(":white_check_mark: {}", crate::steps::summarize(steps));
+            context.push(json!({"type": "mrkdwn", "text": short(&summary, 1900)}));
+            self.remember_steps(&key, steps);
+        }
+        context.push(json!({"type": "mrkdwn", "text": crate::markdown::escape(footer)}));
+        blocks.push(json!({"type": "context", "elements": context}));
+        let button = |label: &str, action: &str| {
+            json!({
+                "type": "button",
+                "text": {"type": "plain_text", "text": label, "emoji": true},
+                "action_id": action,
+                "value": key,
+            })
+        };
+        let mut buttons = vec![button(":+1:", "ost_good"), button(":-1:", "ost_bad")];
+        if steps.len() > 1 {
+            buttons.push(button("Show steps", "ost_steps"));
+        }
+        blocks.push(json!({"type": "actions", "elements": buttons}));
+        let blocks = Value::Array(blocks).to_string();
+        let fallback = short(text, MAX_SECTION_CHARS);
+        let form = [
+            ("channel", channel),
+            ("ts", placeholder),
+            ("text", fallback.as_str()),
+            ("blocks", blocks.as_str()),
+        ];
+        if let Err(e) = self.call("chat.update", &self.bot_token, &form).await {
+            tracing::warn!(
+                "Could not post the formatted answer ({e:#}); sending it as plain text."
+            );
+            return self.deliver(channel, thread, placeholder, text).await;
+        }
+        Ok(())
+    }
+
+    fn remember_steps(&self, key: &str, steps: &[String]) {
+        let mut store = self.steps.lock();
+        if store.len() >= MAX_REMEMBERED_STEPS {
+            store.clear();
+        }
+        store.insert(key.to_string(), steps.to_vec());
     }
 
     /// Look for due scheduled tasks every so often, forever.
@@ -504,7 +716,7 @@ impl Slack {
         }];
         // Each schedule keeps its own transcript, so a run can compare with the last one.
         let conversation = format!("schedule-{}", schedule.id);
-        let reply = self
+        let outcome = self
             .run_task(
                 engine,
                 &conversation,
@@ -515,7 +727,7 @@ impl Slack {
                 &placeholder,
             )
             .await;
-        self.finish(&target, &placeholder, reply).await
+        self.finish(&target, &placeholder, outcome).await
     }
 
     /// Post automation suggestions on a fixed weekly schedule, forever.
@@ -544,7 +756,7 @@ impl Slack {
         }
     }
 
-    /// A click on an approval card.
+    /// A click on a button: an approval card, feedback, or "Show steps".
     fn on_interaction(self: &Arc<Self>, payload: &Value) {
         if payload["type"] != "block_actions" {
             return;
@@ -553,11 +765,44 @@ impl Slack {
             .as_str()
             .unwrap_or_default()
             .to_string();
+        let channel = payload["channel"]["id"]
+            .as_str()
+            .or(payload["container"]["channel_id"].as_str())
+            .unwrap_or_default()
+            .to_string();
         for action in payload["actions"].as_array().into_iter().flatten() {
+            let key = action["value"].as_str().unwrap_or_default();
             let decision = match action["action_id"].as_str() {
                 Some("ost_allow") => Decision::Allow,
                 Some("ost_always") => Decision::AllowAlways,
                 Some("ost_deny") => Decision::Deny,
+                Some(feedback @ ("ost_good" | "ost_bad")) => {
+                    let good = feedback == "ost_good";
+                    self.record_feedback(key, &user, good);
+                    let reply = if good {
+                        "Thanks! Glad that helped."
+                    } else {
+                        "Thanks for saying so. Reply in the thread with what was wrong and I'll fix it                          (and remember it if it's about how your team works)."
+                    };
+                    self.whisper(&channel, &user, reply);
+                    continue;
+                }
+                Some("ost_steps") => {
+                    let steps = self.steps.lock().get(key).cloned();
+                    let text = match steps {
+                        Some(steps) => steps
+                            .iter()
+                            .map(|s| format!("• {s}"))
+                            .collect::<Vec<_>>()
+                            .join(
+                                "
+",
+                            ),
+                        None => "Those steps are no longer available.".into(),
+                    };
+                    self.whisper(&channel, &user, &text);
+                    continue;
+                }
                 _ => continue,
             };
             let id = action["value"].as_str().unwrap_or_default();
@@ -579,23 +824,63 @@ impl Slack {
                 } else {
                     "an approver".to_string()
                 };
-                let (slack, channel, user) = (self.clone(), waiting.channel.clone(), user.clone());
-                tokio::spawn(async move {
-                    let text = format!("Only {who} can decide this one.");
-                    let form = [
-                        ("channel", channel.as_str()),
-                        ("user", user.as_str()),
-                        ("text", text.as_str()),
-                    ];
-                    let _ = slack
-                        .call("chat.postEphemeral", &slack.bot_token, &form)
-                        .await;
-                });
+                self.whisper(
+                    &waiting.channel,
+                    &user,
+                    &format!("Only {who} can decide this one."),
+                );
                 continue;
             }
             if let Some(waiting) = pending.remove(id) {
                 let _ = waiting.answer.send((decision, user.clone()));
             }
+        }
+    }
+
+    /// A message only `user` sees.
+    fn whisper(self: &Arc<Self>, channel: &str, user: &str, text: &str) {
+        let (slack, channel, user, text) = (
+            self.clone(),
+            channel.to_string(),
+            user.to_string(),
+            text.to_string(),
+        );
+        tokio::spawn(async move {
+            let form = [
+                ("channel", channel.as_str()),
+                ("user", user.as_str()),
+                ("text", text.as_str()),
+            ];
+            if let Err(e) = slack
+                .call("chat.postEphemeral", &slack.bot_token, &form)
+                .await
+            {
+                tracing::warn!("Could not send a private reply: {e:#}");
+            }
+        });
+    }
+
+    fn record_feedback(&self, answer: &str, user: &str, good: bool) {
+        let Some(path) = self.feedback_file.lock().clone() else {
+            return;
+        };
+        let line = json!({
+            "at": jiff::Timestamp::now().to_string(),
+            "answer": answer,
+            "user": user,
+            "good": good,
+            "steps": self.steps.lock().get(answer).cloned().unwrap_or_default(),
+        });
+        let write = || -> std::io::Result<()> {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)?;
+            writeln!(file, "{line}")
+        };
+        if let Err(e) = write() {
+            tracing::warn!("Could not record feedback: {e}");
         }
     }
 
@@ -802,6 +1087,19 @@ impl Slack {
             std::fs::create_dir_all(dir)?;
         }
         std::fs::write(&path, &bytes)?;
+        let mut relative = relative;
+        if name.to_lowercase().ends_with(".zip") {
+            let folder = format!("inbox/{}", name[..name.len() - 4].trim_end_matches('.'));
+            match crate::files::extract_zip(&path, &workspace.join(&folder)) {
+                Ok(files) => {
+                    relative = format!(
+                        "{relative}, unpacked into {folder}/ ({} files)",
+                        files.len()
+                    )
+                }
+                Err(e) => relative = format!("{relative} (could not unpack it: {e:#})"),
+            }
+        }
         let mime = file["mimetype"].as_str().unwrap_or_default();
         let image = (matches!(
             mime,
@@ -1467,6 +1765,8 @@ mod tests {
             pending: Mutex::default(),
             names: Mutex::default(),
             channel_ids: Mutex::default(),
+            steps: Mutex::default(),
+            feedback_file: Mutex::default(),
         })
     }
 

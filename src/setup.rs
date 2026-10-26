@@ -404,7 +404,11 @@ pub async fn doctor(config: &Config) -> Result<()> {
         Some(image) if !image_present(image).await => report(
             false,
             "sandbox",
-            format!("image {image} is not pulled. Run: docker pull {image}"),
+            if image == "openslacktag-sandbox" {
+                "image openslacktag-sandbox is not built. Run: docker build -t openslacktag-sandbox sandbox/".to_string()
+            } else {
+                format!("image {image} is not pulled. Run: docker pull {image}")
+            },
         ),
         Some(image) => report(
             true,
@@ -412,6 +416,72 @@ pub async fn doctor(config: &Config) -> Result<()> {
             format!("{image}, network {}", config.sandbox_network),
         ),
         None => println!("[skip] sandbox: SANDBOX_IMAGE is not set, so there is no shell tool"),
+    }
+
+    match &config.search {
+        Some(search) => {
+            let search = crate::search::WebSearch::new(search.clone());
+            match tokio::time::timeout(Duration::from_secs(20), search.search("OpenSlackTag", 1))
+                .await
+            {
+                Ok(Ok(_)) => report(
+                    true,
+                    "search",
+                    format!("{:?} works", config.search.as_ref().map(|s| s.provider)),
+                ),
+                Ok(Err(e)) => report(
+                    false,
+                    "search",
+                    format!("{e:#}. Check SEARCH_API_KEY / SEARCH_URL."),
+                ),
+                Err(_) => report(false, "search", "no answer within 20 seconds".into()),
+            }
+        }
+        None => {
+            println!("[skip] search: SEARCH_PROVIDER is not set, so there is no web_search tool")
+        }
+    }
+
+    match &config.images {
+        Some(images) => report(
+            true,
+            "images",
+            format!("{} at {}", images.model, images.base_url),
+        ),
+        None => {
+            println!("[skip] images: IMAGE_MODEL is not set, so there is no generate_image tool")
+        }
+    }
+
+    match crate::permissions::load_rules(&config.permissions) {
+        Ok(rules) => report(
+            true,
+            "permissions",
+            format!(
+                "{} rules (defaults plus {})",
+                rules.len(),
+                config.permissions.display()
+            ),
+        ),
+        Err(e) => report(false, "permissions", format!("{e:#}")),
+    }
+
+    match crate::skills::Skills::load(&config.skills_dir) {
+        Ok(skills) if skills.is_empty() => {
+            println!("[skip] skills: none in {}", config.skills_dir.display())
+        }
+        Ok(skills) => report(
+            true,
+            "skills",
+            skills
+                .listing()
+                .unwrap_or_default()
+                .lines()
+                .count()
+                .to_string()
+                + " skills",
+        ),
+        Err(e) => report(false, "skills", format!("{e:#}")),
     }
 
     match config.mcp_servers() {

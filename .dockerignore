@@ -1,0 +1,11 @@
+target
+data
+.env
+.env.*
+mcp.json
+permissions.json
+instructions.md
+skills
+.git
+.github
+*.log

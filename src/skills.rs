@@ -261,6 +261,17 @@ mod tests {
     }
 
     #[test]
+    fn the_example_skills_load() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/skills");
+        let skills = Skills::load(&dir).unwrap();
+        let listing = skills.listing().unwrap();
+        for id in ["weekly-report", "incident-summary", "standup-digest"] {
+            assert!(listing.contains(&format!("(`{id}`)")), "{listing}");
+        }
+        assert!(!listing.contains("No description"), "every example has one");
+    }
+
+    #[test]
     fn a_missing_folder_means_no_skills() {
         let skills = Skills::load(Path::new("definitely/not/here")).unwrap();
         assert!(skills.listing().is_none());

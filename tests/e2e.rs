@@ -21,7 +21,7 @@ use axum::extract::{Path as UrlPath, State};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Form, Json, Router};
-use openslacktag::engine::{Engine, Incoming, Parts, Reply, Request, Target};
+use openslacktag::engine::{Engine, Incoming, Parts, Progress, Reply, Request, Target};
 use openslacktag::permissions::{Approval, Approver};
 use openslacktag::slack::Slack;
 use openslacktag_agent::STEER_NOTE;
@@ -212,7 +212,7 @@ fn engine_with(
 fn request<'a>(
     conversation: &'a str,
     incoming: Vec<Incoming>,
-    progress: &'a mpsc::UnboundedSender<String>,
+    progress: &'a mpsc::UnboundedSender<Progress>,
 ) -> Request<'a> {
     Request {
         conversation,
@@ -243,6 +243,16 @@ async fn start_bot(
             .unwrap(),
     );
     tokio::spawn(slack.run(engine, None))
+}
+
+/// A second bot on the same data folder, for clicks after the first finished.
+async fn start_bot_again(
+    _fake: &FakeSlack,
+    api_url: &str,
+    data: &tempfile::TempDir,
+) -> tokio::task::JoinHandle<anyhow::Result<()>> {
+    let (engine, _) = engine_with(MockProvider::new(), data.path(), Vec::new());
+    start_bot(engine, api_url).await
 }
 
 /// The value of an approval card's button, once one is posted.
@@ -308,12 +318,40 @@ async fn a_mention_is_answered_in_its_thread_after_using_a_tool() {
     assert!(
         updates
             .iter()
-            .any(|u| u["text"].starts_with("_Using wiki_write: team/standup")),
+            .any(|u| u["text"].starts_with("_Updating wiki page team/standup")),
         "{updates:?}"
     );
     assert_eq!(
         updates.last().unwrap()["text"],
         "Noted: standup is at *10am*. Saved to <https://example.com/wiki|the wiki>."
+    );
+
+    // Under the answer: what was done, which model, and feedback buttons.
+    let blocks: Value = serde_json::from_str(&updates.last().unwrap()["blocks"]).unwrap();
+    let context = blocks[1]["elements"].to_string();
+    assert!(
+        context.contains("Updated wiki page team/standup"),
+        "{context}"
+    );
+    assert!(context.contains("mock-model"), "{context}");
+    let feedback = blocks[2]["elements"][1]["value"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(blocks[2]["elements"][1]["action_id"], "ost_bad");
+
+    // A thumbs-down is recorded and answered privately.
+    let bot = start_bot_again(&fake, &api_url, &data).await;
+    fake.send(click("U1", "ost_bad", &feedback));
+    wait_for("the feedback reply", || {
+        !fake.calls_to("chat.postEphemeral").is_empty()
+    })
+    .await;
+    bot.abort();
+    let recorded = std::fs::read_to_string(data.path().join("feedback.jsonl")).unwrap();
+    assert!(
+        recorded.contains("\"good\":false") && recorded.contains("U1"),
+        "{recorded}"
     );
 
     let page = std::fs::read_to_string(data.path().join("wiki/team/standup.md")).unwrap();
@@ -1066,5 +1104,86 @@ async fn a_message_accepted_by_a_task_that_then_fails_is_kept() {
             .iter()
             .any(|e| e.text().contains("keep it under a page")),
         "{history:#?}"
+    );
+}
+
+fn channel_message(envelope_id: &str, event_id: &str, text: &str, ts: &str) -> Value {
+    json!({
+        "type": "events_api",
+        "envelope_id": envelope_id,
+        "payload": {
+            "event_id": event_id,
+            "event": {
+                "type": "message", "channel_type": "channel", "user": "U1", "text": text,
+                "ts": ts, "channel": "C0123456789"
+            }
+        }
+    })
+}
+
+#[tokio::test]
+async fn channel_triggers_answer_matching_messages_in_their_thread() {
+    let data = tempfile::tempdir().unwrap();
+    let (engine, model) = engine_with(
+        MockProvider::new()
+            .replying("Triaged: billing issue, assigned to <@U7>.")
+            .replying("SKIP"),
+        data.path(),
+        Vec::new(),
+    );
+    engine
+        .schedules()
+        .add_watch(
+            "C0123456789",
+            Some("help"),
+            "Triage support requests",
+            Some("U9".into()),
+        )
+        .unwrap();
+    let (fake, api_url) = start_fake_slack().await;
+    fake.respond("conversations.replies", json!({"ok": true, "messages": []}));
+    fake.send(channel_message(
+        "e1",
+        "Ev1",
+        "I need help with billing",
+        "1700000100.000100",
+    ));
+    fake.send(channel_message(
+        "e2",
+        "Ev2",
+        "lunch anyone?",
+        "1700000101.000100",
+    ));
+    fake.send(channel_message(
+        "e3",
+        "Ev3",
+        "help, is this normal?",
+        "1700000102.000100",
+    ));
+    let bot = start_bot(engine, &api_url).await;
+
+    wait_for("the triage", || {
+        answered(&fake, "Triaged: billing issue, assigned to <@U7>.")
+    })
+    .await;
+    wait_for("the skip", || !fake.calls_to("chat.delete").is_empty()).await;
+    bot.abort();
+
+    let posts = fake.calls_to("chat.postMessage");
+    assert_eq!(
+        posts.len(),
+        2,
+        "only the two matching messages started work: {posts:?}"
+    );
+    assert_eq!(posts[0]["thread_ts"], "1700000100.000100");
+    let requests = model.requests();
+    assert!(requests[0].system.contains("Triage support requests"));
+    assert!(
+        requests[0]
+            .history
+            .last()
+            .unwrap()
+            .text()
+            .contains("I need help with billing")
     );
 }

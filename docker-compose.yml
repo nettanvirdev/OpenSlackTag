@@ -1,0 +1,24 @@
+# OpenSlackTag with Docker.
+#
+# Everything (.env, mcp.json, permissions.json, skills/, instructions.md and
+# the data/ folder) lives in the folder you run this from.
+#
+#   docker compose run --rm openslacktag setup     # once: guided setup, writes .env
+#   docker compose up -d                           # run it
+#   docker compose logs -f                         # watch it
+#   docker compose run --rm openslacktag doctor    # check everything
+#
+# To give the teammate its own sandboxed computer (run_shell), use the
+# sandbox override as well; read its header first:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.sandbox.yml up -d
+
+services:
+  openslacktag:
+    image: ghcr.io/nettanvirdev/openslacktag:latest
+    build: .
+    restart: unless-stopped
+    init: true
+    volumes:
+      - ./:/srv
+    # Socket Mode connects out to Slack, so no ports need to be open.
