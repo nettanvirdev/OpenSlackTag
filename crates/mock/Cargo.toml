@@ -1,0 +1,24 @@
+[package]
+name = "openslacktag-mock"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+description = "Fake implementations of every OpenSlackTag trait, for tests and the headless harness."
+
+[lints]
+workspace = true
+
+[dependencies]
+openslacktag-core = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+parking_lot = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

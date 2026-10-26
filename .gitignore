@@ -1,0 +1,18 @@
+# Build output
+/target
+
+# Secrets and local settings: never commit these
+.env
+.env.*
+!.env.example
+mcp.json
+*.pem
+*.key
+
+# Runtime data: the wiki, conversation transcripts and sandbox workspaces
+/data/
+
+# Noise
+*.log
+.DS_Store
+Thumbs.db

@@ -1,0 +1,30 @@
+[package]
+name = "openslacktag-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+description = "The agent turn loop. Depends on trait seams only - never on a concrete provider, tool, or store."
+
+[lints]
+workspace = true
+
+# Note what is *not* here: no reqwest, no openslacktag-provider, no openslacktag-tools,
+# no openslacktag-store. This crate orchestrates traits. If it ever needs to name a
+# concrete implementation, the design has gone wrong.
+[dependencies]
+openslacktag-core = { workspace = true }
+async-stream = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+openslacktag-mock = { workspace = true }
+tempfile = { workspace = true }
+openslacktag-tools = { workspace = true }
+tokio = { workspace = true }

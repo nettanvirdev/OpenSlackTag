@@ -1,0 +1,100 @@
+[package]
+name = "openslacktag"
+description = "An open-source AI teammate for Slack: tag it with a task, it does the work and replies in the thread."
+version.workspace = true
+edition = "2024"
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+openslacktag-core = { workspace = true }
+openslacktag-provider = { workspace = true }
+openslacktag-agent = { workspace = true }
+openslacktag-mcp = { workspace = true }
+openslacktag-tools = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+dotenvy = "0.15"
+futures = { workspace = true }
+html2text = "0.17"
+jiff = { workspace = true }
+parking_lot = { workspace = true }
+reqwest = { workspace = true }
+rpassword = "7"
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+openslacktag-mock = { workspace = true }
+axum = { version = "0.8", features = ["ws"] }
+tempfile = { workspace = true }
+
+[workspace]
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT"
+authors = ["nettanvirdev"]
+repository = "https://github.com/nettanvirdev/OpenSlackTag"
+homepage = "https://github.com/nettanvirdev/OpenSlackTag"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+unreachable_pub = "warn"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+await_holding_lock = "warn"
+unwrap_used = "warn"
+expect_used = "warn"
+todo = "warn"
+dbg_macro = "warn"
+inefficient_to_string = "warn"
+needless_pass_by_value = "warn"
+implicit_clone = "warn"
+
+[workspace.dependencies]
+openslacktag-core = { path = "crates/core" }
+openslacktag-provider = { path = "crates/provider" }
+openslacktag-agent = { path = "crates/agent" }
+openslacktag-mcp = { path = "crates/mcp" }
+openslacktag-tools = { path = "crates/tools" }
+openslacktag-mock = { path = "crates/mock" }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+async-trait = "0.1"
+# thiserror in the library crates, anyhow only at the app edge.
+thiserror = "2"
+anyhow = "1"
+futures = "0.3"
+futures-util = "0.3"
+async-stream = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "io-std", "process", "sync", "time", "signal", "net"] }
+# rustls rather than native-tls: no OpenSSL to find at build time on Windows.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "charset", "http2"] }
+url = "2"
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+jiff = { version = "0.2", features = ["serde"] }
+schemars = { version = "1", features = ["preserve_order"] }
+parking_lot = "0.12"
+# API keys wrapped so they cannot be printed by an accidental `{:?}`.
+secrecy = { version = "0.10", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tempfile = "3"
+wiremock = "0.6"
