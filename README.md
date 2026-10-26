@@ -4,14 +4,23 @@
 
 An open-source AI teammate for Slack. Mention it with a task. It does the work with real tools and replies in the thread with the result.
 
-```
-you        @OpenSlackTag what changed in our deploy process this month? update the wiki
-teammate   Reading #releases…
-           Deploys now go through the `release` workflow instead of manual tags (since Oct 3, <link|PR #412>).
-           Rollbacks use `make rollback`. I updated *processes/deploys* in the wiki.
-           ✓ Read #releases, searched the wiki and 2 more · claude-sonnet-4-5 · 14s
-           [👍] [👎] [Show steps]
-```
+## See it in action
+
+*These screenshots come from a demo workspace. The company, the people and the data are made up.*
+
+**It analyses your data.** Maya drops a CSV into #growth. OpenSlackTag runs Python on it, posts a chart, and explains what moved the numbers.
+
+![OpenSlackTag charting a CSV of weekly signups in a Slack thread and explaining what changed](docs/screenshots/analysis.png)
+
+**It investigates, then asks before acting.** It traces a customer's failed export to a line of code and the release that broke it. Then it asks before filing a GitHub issue through MCP.
+
+![OpenSlackTag finding a bug's cause, then showing an approval card before creating a GitHub issue](docs/screenshots/approval.png)
+
+**It works on a schedule.** Every Monday at 09:00 it posts an engineering digest to #eng: what shipped, what's stuck, and what's coming up.
+
+![OpenSlackTag's Monday engineering digest, posted on its own in #eng](docs/screenshots/routine.png)
+
+## Features
 
 **Does the work**
 - It reads channels and threads and fetches web pages. Connect a search MCP server such as Firecrawl to let it search the web too.
@@ -304,6 +313,24 @@ The tests need no Slack workspace and no API key. `tests/e2e.rs` runs the real S
 - approval clicks by the right and wrong people
 - file and image handling and uploads
 - private-channel checks, routines and watches, helpers, and compaction
+
+## Inspiration and similar products
+
+OpenSlackTag started as an open-source rebuild of [OpenTag](https://www.tryopentag.com) (Y Combinator S26), an AI coworker that lives in Slack. Anthropic's Claude Tag does the same job for teams on Claude's paid plans. Both are hosted products that work well if you'd rather not run anything yourself.
+
+OpenSlackTag is for teams that want to run it on their own machine, read and change the code, and choose the model.
+
+| | OpenSlackTag | OpenTag | Claude Tag |
+|---|---|---|---|
+| Source code | Open (MIT) | Closed | Closed |
+| Runs on | Your machine or server | OpenTag's cloud | Anthropic's cloud |
+| Your data | Stays on your disk | Stored by OpenTag | Stored by Anthropic |
+| Models | Any: Anthropic, OpenAI-compatible APIs, or local models through Ollama | 40+ models, chosen for you | Claude only |
+| Price | Free. You pay your model provider directly. | $500 a month for the Team plan (shared credits), or a custom Enterprise plan | Needs a paid Claude plan, plus usage |
+| Setup | About 15 minutes with `openslacktag setup` | Install from the Slack Marketplace | Enabled by a Slack admin |
+| Who keeps it running | You | OpenTag | Anthropic |
+
+This comparison is based on each product's public pages as of October 2026. OpenSlackTag is an independent project and isn't affiliated with OpenTag, Anthropic, Y Combinator or Slack.
 
 ## Roadmap
 
