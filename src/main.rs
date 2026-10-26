@@ -20,7 +20,7 @@ Commands:
   setup                Guided setup: pick a model, connect Slack, write .env
   slack                Run the teammate in Slack
   chat                 Talk to the teammate here in the terminal (no Slack needed)
-  doctor               Check the model, Slack, the sandbox, search and MCP servers
+  doctor               Check the model, Slack, the sandbox and MCP servers
   schedules            List scheduled tasks (`schedules cancel <id>` to remove one)
   usage [days]         Token usage per day and model (default: 30 days)
   audit [count]        The last tool calls: who asked, what ran, how it ended (default: 50)

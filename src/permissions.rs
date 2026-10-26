@@ -55,7 +55,6 @@ impl Approver for NobodyToAsk {
 pub fn default_rules() -> Vec<Rule> {
     let allow = [
         "web_fetch",
-        "web_search",
         "wiki_*",
         "run_shell",
         "read_file",

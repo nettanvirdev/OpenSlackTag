@@ -114,7 +114,7 @@ pub struct Parts {
     pub skills: Skills,
     /// The operator's standing instructions, added to every system prompt.
     pub instructions: Option<String>,
-    /// Extra tools: web search when configured, and tools for tests.
+    /// Extra tools: image generation when configured, and tools for tests.
     pub extra_tools: Vec<Arc<dyn Tool>>,
 }
 
@@ -196,6 +196,18 @@ impl Engine {
         tools.extend(crate::files::file_tools());
         tools.extend(parts.skills.tools());
         tools.extend(parts.extra_tools);
+        // The built-in web_fetch is a fallback: an MCP server that reads pages
+        // (Firecrawl, a browser, a fetch server) takes its place.
+        let mcp_reads_pages = parts.mcp.connected().iter().any(|server| {
+            parts
+                .mcp
+                .tools_for(&server.id)
+                .iter()
+                .any(|t| reads_pages(&t.name))
+        });
+        if mcp_reads_pages {
+            tools.retain(|t| t.id() != "web_fetch");
+        }
         let schedules = Arc::new(Schedules::open(parts.data_dir.join("schedules.json")));
         Ok(Self {
             provider: parts.provider,
@@ -736,6 +748,15 @@ impl Drop for RunningGuard<'_> {
     }
 }
 
+/// Whether an MCP tool reads web pages, judged by its name.
+// ponytail: a name heuristic; a WEB_FETCH=on/off setting if it guesses wrong.
+fn reads_pages(tool: &str) -> bool {
+    let tool = tool.to_lowercase();
+    ["fetch", "scrape", "crawl", "browser_navigate"]
+        .iter()
+        .any(|word| tool.contains(word))
+}
+
 /// The folder a conversation's files and sandboxed shell work in.
 pub fn workspace_dir(data_dir: &Path, conversation: &str) -> PathBuf {
     data_dir
@@ -787,8 +808,8 @@ end to end with your tools and reply in the thread with the result.
 # How to work
 
 - Do the work that was asked, not a plan for it. If the request is clear enough to act on, act, then report.
-- Check facts with your tools instead of guessing. Search the web when you need current information. If something \
-fails, say so plainly with the error; never claim success you did not verify.
+- Check facts with your tools instead of guessing, including for current information. If something fails, say so \
+plainly with the error; never claim success you did not verify.
 - Finish. If a task has four parts, do four. If one is blocked, do the rest and say which one and why.
 - Big jobs with independent parts (research several things, review several files) go faster with delegate, which \
 runs helpers in parallel.
@@ -826,6 +847,21 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    #[test]
+    fn page_reading_mcp_tools_replace_web_fetch() {
+        for name in [
+            "fetch",
+            "firecrawl_scrape",
+            "browser_navigate",
+            "crawl_site",
+        ] {
+            assert!(reads_pages(name), "{name}");
+        }
+        for name in ["create_issue", "list_files", "query"] {
+            assert!(!reads_pages(name), "{name}");
+        }
+    }
 
     #[test]
     fn cursors_compare_numerically() {

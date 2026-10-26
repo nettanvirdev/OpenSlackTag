@@ -16,7 +16,6 @@ use serde::Deserialize;
 use crate::engine::{Engine, Parts};
 use crate::images::{GenerateImage, ImageConfig};
 use crate::permissions::load_rules;
-use crate::search::{SearchConfig, WebSearch};
 use crate::skills::Skills;
 use crate::tools::Sandbox;
 use openslacktag_core::tool::Tool;
@@ -59,7 +58,6 @@ pub struct Config {
     pub skills_dir: PathBuf,
     /// Standing instructions added to every system prompt.
     pub instructions: PathBuf,
-    pub search: Option<SearchConfig>,
     /// Image generation, when IMAGE_MODEL is set.
     pub images: Option<ImageConfig>,
     /// Where weekly automation suggestions are posted, if anywhere.
@@ -136,14 +134,6 @@ impl Config {
             instructions: var("INSTRUCTIONS")
                 .unwrap_or_else(|| "instructions.md".into())
                 .into(),
-            search: match var("SEARCH_PROVIDER") {
-                Some(provider) => Some(SearchConfig::new(
-                    &provider,
-                    var("SEARCH_API_KEY"),
-                    var("SEARCH_URL"),
-                )?),
-                None => None,
-            },
             suggestions_channel: var("SUGGESTIONS_CHANNEL"),
             images: var("IMAGE_MODEL").map(|model| ImageConfig {
                 // Same provider as the chat model by default, if it is OpenAI-compatible.
@@ -230,9 +220,6 @@ impl Config {
             }
         };
         let mut extra_tools: Vec<Arc<dyn Tool>> = Vec::new();
-        if let Some(search) = &self.search {
-            extra_tools.push(Arc::new(WebSearch::new(search.clone())));
-        }
         if let Some(images) = &self.images {
             extra_tools.push(Arc::new(GenerateImage::new(images.clone())));
         }

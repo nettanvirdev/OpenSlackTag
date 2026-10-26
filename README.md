@@ -14,7 +14,7 @@ teammate   Reading #releases…
 ```
 
 **Does the work**
-- It reads channels and threads, searches the web, and fetches pages.
+- It reads channels and threads and fetches web pages. Connect a search MCP server such as Firecrawl to let it search the web too.
 - It runs Python and shell on its own sandboxed computer, so it can make spreadsheets, charts and Word or PowerPoint files and post them in the thread.
 - It generates images.
 - It uses anything you connect over MCP: GitHub, Linear, a browser, your database.
@@ -152,7 +152,7 @@ Watches also run on posts from apps such as alerting tools. They are capped at 3
 | `openslacktag setup` | Guided setup: model, Slack app, sandbox. Writes `.env`. |
 | `openslacktag slack` | Runs the teammate in Slack. |
 | `openslacktag chat` | Talks to the teammate in the terminal. `/new` starts over, `/quit` leaves. |
-| `openslacktag doctor` | Checks the model, Slack, sandbox, search, images, permissions, skills and MCP servers, and says how to fix each failure. |
+| `openslacktag doctor` | Checks the model, Slack, sandbox, images, permissions, skills and MCP servers, and says how to fix each failure. |
 | `openslacktag schedules` | Lists routines and watches. `schedules cancel <id>` removes one. |
 | `openslacktag usage [days]` | Token usage per day and model. |
 | `openslacktag audit [count]` | The last tool calls: who asked, what ran, how it ended. |
@@ -173,7 +173,6 @@ Everything lives in `.env` in the folder you run from. [.env.example](.env.examp
 | `ALLOWED_USERS` | everyone in the workspace | Comma-separated user ids allowed to use the teammate |
 | `APPROVERS` | whoever asked | User ids allowed to approve tools that ask first |
 | `PERMISSIONS` | `permissions.json` | Allow, ask and deny rules (see below) |
-| `SEARCH_PROVIDER` | off | `brave`, `tavily` or `searxng` (with `SEARCH_API_KEY` or `SEARCH_URL`) |
 | `IMAGE_MODEL` | off | Turns on `generate_image`. `IMAGE_BASE_URL` and `IMAGE_API_KEY` default to the chat provider's. |
 | `SANDBOX_IMAGE` | off | Docker image for `run_shell`, e.g. `openslacktag-sandbox` |
 | `SANDBOX_NETWORK` | `none` | `bridge` gives the sandbox network access (see Safety) |
@@ -217,13 +216,14 @@ Copy [mcp.example.json](mcp.example.json) to `mcp.json` and list your servers. I
       "args": ["-y", "@modelcontextprotocol/server-github"],
       "env": { "GITHUB_PERSONAL_ACCESS_TOKEN": "..." }
     },
+    "firecrawl": { "command": "npx", "args": ["-y", "firecrawl-mcp"], "env": { "FIRECRAWL_API_KEY": "fc-..." } },
     "browser": { "command": "npx", "args": ["-y", "@playwright/mcp@latest", "--headless", "--isolated"] },
     "remote": { "url": "https://mcp.example.com/mcp", "headers": { "Authorization": "Bearer ..." } }
   }
 }
 ```
 
-Their tools show up as `<server>_<tool>`. A server that fails to start is reported and skipped, so it never takes the bot down. The `browser` entry gives the teammate a real browser for pages that need JavaScript or a login flow.
+Their tools show up as `<server>_<tool>`. A server that fails to start is reported and skipped, so it never takes the bot down. Web search comes from MCP: `firecrawl` searches and scrapes, and `browser` gives the teammate a real browser for pages that need JavaScript or a login flow. Without one, the built-in `web_fetch` reads plain pages; it steps aside when an MCP server provides its own fetch, scrape, crawl or browser tool.
 
 ### Skills and instructions
 

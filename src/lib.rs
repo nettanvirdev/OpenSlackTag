@@ -12,7 +12,6 @@ pub mod images;
 pub mod markdown;
 pub mod permissions;
 pub mod schedule;
-pub mod search;
 pub mod setup;
 pub mod skills;
 pub mod slack;

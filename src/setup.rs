@@ -503,30 +503,6 @@ pub async fn doctor(config: &Config) -> Result<()> {
         None => println!("[skip] sandbox: SANDBOX_IMAGE is not set, so there is no shell tool"),
     }
 
-    match &config.search {
-        Some(search) => {
-            let search = crate::search::WebSearch::new(search.clone());
-            match tokio::time::timeout(Duration::from_secs(20), search.search("OpenSlackTag", 1))
-                .await
-            {
-                Ok(Ok(_)) => report(
-                    true,
-                    "search",
-                    format!("{:?} works", config.search.as_ref().map(|s| s.provider)),
-                ),
-                Ok(Err(e)) => report(
-                    false,
-                    "search",
-                    format!("{e:#}. Check SEARCH_API_KEY / SEARCH_URL."),
-                ),
-                Err(_) => report(false, "search", "no answer within 20 seconds".into()),
-            }
-        }
-        None => {
-            println!("[skip] search: SEARCH_PROVIDER is not set, so there is no web_search tool")
-        }
-    }
-
     match &config.images {
         Some(images) => {
             let checked = check_images(images).await;

@@ -46,15 +46,7 @@ fn host(url: &str) -> String {
 /// The labels for a call to `tool` with `args`.
 pub fn label(tool: &str, args: &Value) -> Step {
     let s = |key: &str| args[key].as_str().unwrap_or_default();
-    let short = |text: &str| crate::one_line(text, 60);
     match tool {
-        "web_search" => {
-            let q = short(s("query"));
-            step(
-                format!("Searching the web for \u{201c}{q}\u{201d}"),
-                format!("Searched the web for \u{201c}{q}\u{201d}"),
-            )
-        }
         "web_fetch" => {
             let h = host(s("url"));
             step(format!("Reading {h}"), format!("Read {h}"))
@@ -182,10 +174,6 @@ mod tests {
         assert_eq!(
             label("github_create_issue", &json!({})).done,
             "Used github_create_issue"
-        );
-        assert_eq!(
-            label("web_search", &json!({"query": "rust"})).done,
-            "Searched the web for \u{201c}rust\u{201d}"
         );
     }
 
