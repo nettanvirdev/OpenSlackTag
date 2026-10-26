@@ -44,3 +44,12 @@ jobs:
         run: docker build -t openslacktag-sandbox sandbox/
       - name: The sandbox has its tools
         run: docker run --rm openslacktag-sandbox python -c "import pandas, openpyxl, docx, pptx, matplotlib; print('ok')"
+      - name: It writes as the folder's owner and can reach the sandbox
+        run: |
+          mkdir work && sudo chown 1234:1234 work
+          docker run --rm -v "$PWD/work:/srv" -v /var/run/docker.sock:/var/run/docker.sock \
+            -e LLM_PROVIDER=openai -e LLM_MODEL=x -e LLM_BASE_URL=http://127.0.0.1:9/v1 \
+            -e SANDBOX_IMAGE=openslacktag-sandbox \
+            openslacktag:ci doctor | tee doctor.txt || true
+          test "$(stat -c %u work/data)" = 1234
+          grep -F "[ok]   sandbox" doctor.txt

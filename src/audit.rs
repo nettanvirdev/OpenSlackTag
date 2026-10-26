@@ -1,7 +1,6 @@
 //! The audit log: one line per tool call in `DATA_DIR/audit.jsonl`, with who
 //! asked, what ran on what, and how it ended. Read it with `openslacktag audit`.
 
-use std::io::Write;
 use std::path::Path;
 
 use anyhow::Result;
@@ -26,12 +25,10 @@ pub fn record(data_dir: &Path, line: &Line) {
     let mut line = line.clone();
     line.args = line.args.chars().take(MAX_ARGS_CHARS).collect();
     let write = || -> std::io::Result<()> {
-        std::fs::create_dir_all(data_dir)?;
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(data_dir.join("audit.jsonl"))?;
-        writeln!(file, "{}", serde_json::to_string(&line)?)
+        crate::append_line(
+            &data_dir.join("audit.jsonl"),
+            &serde_json::to_string(&line)?,
+        )
     };
     if let Err(e) = write() {
         tracing::warn!("could not write the audit log: {e}");

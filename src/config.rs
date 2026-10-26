@@ -185,15 +185,16 @@ impl Config {
     }
 
     pub fn sandbox(&self) -> Option<Sandbox> {
-        let host_data_dir = self.sandbox_host_data_dir.clone().map(|host| {
-            let data =
-                std::path::absolute(&self.data_dir).unwrap_or_else(|_| self.data_dir.clone());
-            (data, host)
-        });
-        self.sandbox_image.clone().map(|image| Sandbox {
+        let image = self.sandbox_image.clone()?;
+        let data = std::path::absolute(&self.data_dir).unwrap_or_else(|_| self.data_dir.clone());
+        let host = self
+            .sandbox_host_data_dir
+            .clone()
+            .or_else(|| own_container_mounts().and_then(|m| host_path(&m, &data)));
+        Some(Sandbox {
             image,
             network: self.sandbox_network.clone(),
-            host_data_dir,
+            host_data_dir: host.map(|host| (data, host)),
         })
     }
 
@@ -332,11 +333,60 @@ fn var(name: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+/// When running in a container, its mounts as Docker reports them. Sandbox
+/// containers are started by the host's Docker, so they need host paths.
+fn own_container_mounts() -> Option<String> {
+    if !std::path::Path::new("/.dockerenv").exists() {
+        return None;
+    }
+    let id = std::fs::read_to_string("/etc/hostname").ok()?;
+    let out = std::process::Command::new("docker")
+        .args(["inspect", "--format", "{{json .Mounts}}", id.trim()])
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// The host path of `inside`, from a container's mounts (`docker inspect`
+/// JSON): the bind mount covering it most closely.
+fn host_path(mounts: &str, inside: &std::path::Path) -> Option<PathBuf> {
+    let mounts: Vec<serde_json::Value> = serde_json::from_str(mounts).ok()?;
+    mounts
+        .iter()
+        .filter(|m| m["Type"] == "bind")
+        .filter_map(|m| {
+            let rest = inside.strip_prefix(m["Destination"].as_str()?).ok()?;
+            Some((
+                m["Destination"].as_str()?.len(),
+                PathBuf::from(m["Source"].as_str()?).join(rest),
+            ))
+        })
+        .max_by_key(|(len, _)| *len)
+        .map(|(_, path)| path)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    #[test]
+    fn finds_the_host_path_of_the_data_folder() {
+        let mounts = r#"[
+            {"Type": "bind", "Source": "/home/me/bot", "Destination": "/srv"},
+            {"Type": "bind", "Source": "/var/run/docker.sock", "Destination": "/var/run/docker.sock"},
+            {"Type": "volume", "Source": "/var/lib/docker/volumes/x", "Destination": "/srv/data"}
+        ]"#;
+        assert_eq!(
+            host_path(mounts, std::path::Path::new("/srv/data")),
+            Some(PathBuf::from("/home/me/bot/data"))
+        );
+        assert_eq!(host_path(mounts, std::path::Path::new("/elsewhere")), None);
+        assert_eq!(host_path("not json", std::path::Path::new("/srv")), None);
+    }
 
     #[test]
     fn parses_claude_style_mcp_config() {

@@ -4,8 +4,9 @@
 //!
 //! Times are in the server's local time zone (set `TZ` to change it).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use anyhow::{Result, bail};
 use async_trait::async_trait;
@@ -117,7 +118,8 @@ fn parse_duration(text: &str) -> Result<SignedDuration> {
     Ok(SignedDuration::from_mins(minutes))
 }
 
-/// `every day at 09:00`, `every weekday at 9:30`, `every monday at 17:00`.
+/// `every day at 09:00`, `every weekday at 9:30`, `every monday at 17:00`,
+/// `every mon,thu at 10:00`.
 fn friendly_to_cron(w: &str) -> Result<Option<String>> {
     let Some(rest) = w.strip_prefix("every ") else {
         return Ok(None);
@@ -144,10 +146,27 @@ fn friendly_to_cron(w: &str) -> Result<Option<String>> {
         "day" => "*".to_string(),
         "weekday" => "1-5".to_string(),
         "weekend" | "weekend day" => "0,6".to_string(),
-        day => match DAYS.iter().position(|d| *d == day) {
-            Some(i) => i.to_string(),
-            None => return Ok(None),
-        },
+        list => {
+            let mut picked = Vec::new();
+            for day in list
+                .split([',', ' '])
+                .map(|d| d.trim().trim_end_matches('s'))
+                .filter(|d| !d.is_empty() && *d != "and")
+            {
+                // Full names or abbreviations: mon, tue, thur.
+                match DAYS
+                    .iter()
+                    .position(|d| *d == day || (day.len() >= 3 && d.starts_with(day)))
+                {
+                    Some(i) => picked.push(i.to_string()),
+                    None => return Ok(None),
+                }
+            }
+            if picked.is_empty() {
+                return Ok(None);
+            }
+            picked.join(",")
+        }
     };
     Ok(Some(format!("{minute} {hour} * * {dow}")))
 }
@@ -216,7 +235,11 @@ impl Cron {
                 continue;
             }
             if !self.hours[t.hour() as usize] {
-                let next_hour = t.timestamp().as_second() / 3600 * 3600 + 3600;
+                // The next local hour, which is not a UTC hour in zones like
+                // Asia/Kolkata (+05:30).
+                let next_hour =
+                    t.timestamp().as_second() - i64::from(t.minute()) * 60 - i64::from(t.second())
+                        + 3600;
                 t = Timestamp::from_second(next_hour).ok()?.to_zoned(tz.clone());
                 continue;
             }
@@ -227,6 +250,14 @@ impl Cron {
         }
         None
     }
+}
+
+fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
+    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+}
+
+fn modified(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
 /// One cron field as a lookup table indexed by value.
@@ -288,6 +319,9 @@ pub struct Schedules {
     watches: Mutex<Vec<Watch>>,
     /// Recent trigger times per watch, for the hourly cap.
     fired: Mutex<std::collections::HashMap<String, Vec<Timestamp>>>,
+    /// The files' modification times when last read or written, to notice
+    /// changes from another process (`openslacktag schedules cancel`).
+    seen: Mutex<(Option<SystemTime>, Option<SystemTime>)>,
     tz: TimeZone,
 }
 
@@ -318,14 +352,38 @@ impl Schedules {
         let watches = read(&watches_path)
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
+        let seen = Mutex::new((modified(&path), modified(&watches_path)));
         Self {
             path,
             items: Mutex::new(items),
             watches_path,
             watches: Mutex::new(watches),
             fired: Mutex::default(),
+            seen,
             tz: TimeZone::system(),
         }
+    }
+
+    /// Reload a file another process changed since we last read or wrote it.
+    fn refresh(&self) {
+        let now = (modified(&self.path), modified(&self.watches_path));
+        let before = std::mem::replace(&mut *self.seen.lock(), now);
+        if now.0 != before.0
+            && let Some(items) = read_json(&self.path)
+        {
+            *self.items.lock() = items;
+        }
+        if now.1 != before.1
+            && let Some(watches) = read_json(&self.watches_path)
+        {
+            *self.watches.lock() = watches;
+        }
+    }
+
+    fn save_watches(&self, watches: &[Watch]) -> Result<()> {
+        crate::write_atomic(&self.watches_path, &serde_json::to_vec_pretty(watches)?)?;
+        self.seen.lock().1 = modified(&self.watches_path);
+        Ok(())
     }
 
     pub fn add_watch(
@@ -335,6 +393,7 @@ impl Schedules {
         prompt: &str,
         created_by: Option<String>,
     ) -> Result<Watch> {
+        self.refresh();
         let looks_like_id = channel.len() > 8
             && channel.starts_with(['C', 'G'])
             && channel
@@ -355,17 +414,19 @@ impl Schedules {
             created_by,
         };
         watches.push(watch.clone());
-        crate::write_atomic(&self.watches_path, &serde_json::to_vec_pretty(&*watches)?)?;
+        self.save_watches(&watches)?;
         Ok(watch)
     }
 
     pub fn watches(&self) -> Vec<Watch> {
+        self.refresh();
         self.watches.lock().clone()
     }
 
     /// The triggers a new message in `channel` sets off, within each one's
     /// hourly cap.
     pub fn triggered(&self, channel: &str, text: &str) -> Vec<Watch> {
+        self.refresh();
         let text = text.to_lowercase();
         let now = Timestamp::now();
         let hour_ago = now - SignedDuration::from_hours(1);
@@ -401,6 +462,7 @@ impl Schedules {
         when: Option<&str>,
         contains: Option<&str>,
     ) -> Result<()> {
+        self.refresh();
         {
             let mut items = self.items.lock();
             if let Some(schedule) = items.iter_mut().find(|s| s.id == id) {
@@ -434,7 +496,7 @@ impl Schedules {
         if let Some(contains) = contains {
             watch.contains = (!contains.is_empty()).then(|| contains.to_string());
         }
-        crate::write_atomic(&self.watches_path, &serde_json::to_vec_pretty(&*watches)?)
+        self.save_watches(&watches)
     }
 
     fn now(&self) -> Zoned {
@@ -448,6 +510,7 @@ impl Schedules {
         target: Target,
         created_by: Option<String>,
     ) -> Result<Schedule> {
+        self.refresh();
         let now = self.now();
         let spec = Spec::parse(when, &now)?;
         let next_run = spec
@@ -472,11 +535,13 @@ impl Schedules {
     }
 
     pub fn list(&self) -> Vec<Schedule> {
+        self.refresh();
         self.items.lock().clone()
     }
 
     /// Delete a scheduled routine or a trigger.
     pub fn cancel(&self, id: &str) -> Result<bool> {
+        self.refresh();
         let mut items = self.items.lock();
         let before = items.len();
         items.retain(|s| s.id != id);
@@ -489,7 +554,7 @@ impl Schedules {
         let before = watches.len();
         watches.retain(|w| w.id != id);
         if watches.len() != before {
-            crate::write_atomic(&self.watches_path, &serde_json::to_vec_pretty(&*watches)?)?;
+            self.save_watches(&watches)?;
             return Ok(true);
         }
         Ok(false)
@@ -498,6 +563,7 @@ impl Schedules {
     /// Schedules due now. Each is advanced to its next run (or removed, for a
     /// one-off) before it is returned, so a crash mid-run cannot run it twice.
     pub fn take_due(&self) -> Vec<Schedule> {
+        self.refresh();
         let now = self.now();
         let mut items = self.items.lock();
         let mut due = Vec::new();
@@ -538,7 +604,9 @@ impl Schedules {
     }
 
     fn save(&self, items: &[Schedule]) -> Result<()> {
-        crate::write_atomic(&self.path, &serde_json::to_vec_pretty(items)?)
+        crate::write_atomic(&self.path, &serde_json::to_vec_pretty(items)?)?;
+        self.seen.lock().0 = modified(&self.path);
+        Ok(())
     }
 
     pub fn describe(&self, s: &Schedule) -> String {
@@ -762,21 +830,28 @@ impl Tool for ScheduleTool {
 
 impl ScheduleTool {
     /// Routines can only be changed from the channel they belong to.
+    /// The routine must be in this channel, and only whoever set it up may
+    /// change it: it runs as them.
     fn check_here(&self, id: &str) -> ToolResult<()> {
-        let here = self
+        let owner = self
             .schedules
             .list()
             .iter()
-            .any(|s| s.id == id && s.target.channel == self.target.channel)
-            || self
-                .schedules
-                .watches()
-                .iter()
-                .any(|w| w.id == id && w.channel == self.target.channel);
-        if here {
-            Ok(())
-        } else {
-            Err(Error::not_found("routine in this channel", id))
+            .find(|s| s.id == id && s.target.channel == self.target.channel)
+            .map(|s| s.created_by.clone())
+            .or_else(|| {
+                self.schedules
+                    .watches()
+                    .iter()
+                    .find(|w| w.id == id && w.channel == self.target.channel)
+                    .map(|w| w.created_by.clone())
+            });
+        match owner {
+            None => Err(Error::not_found("routine in this channel", id)),
+            Some(Some(owner)) if self.requester.as_ref() != Some(&owner) => Err(Error::Denied(
+                format!("only <@{owner}>, who set it up, can change or delete it"),
+            )),
+            Some(_) => Ok(()),
         }
     }
 }
@@ -817,6 +892,98 @@ mod tests {
             .to_zoned(now.time_zone().clone())
             .strftime("%a %Y-%m-%d %H:%M")
             .to_string()
+    }
+
+    #[test]
+    fn day_lists_and_half_hour_zones() {
+        assert_eq!(
+            next("every monday,thursday at 10:00", "2026-10-27T08:00"),
+            "Thu 2026-10-29 10:00"
+        );
+        assert_eq!(
+            next("every mon and fri at 10:00", "2026-10-27T08:00"),
+            "Fri 2026-10-30 10:00"
+        );
+        assert!(Spec::parse("every moonday at 10:00", &at("2026-10-27T08:00")).is_err());
+        for zone in ["Asia/Kolkata", "Asia/Kathmandu", "Australia/Adelaide"] {
+            let now = "2026-10-26T08:10"
+                .parse::<DateTime>()
+                .unwrap()
+                .to_zoned(TimeZone::get(zone).unwrap())
+                .unwrap();
+            let when = Spec::parse("every day at 09:00", &now)
+                .unwrap()
+                .next_after(&now)
+                .unwrap()
+                .to_zoned(now.time_zone().clone());
+            assert_eq!(
+                when.strftime("%Y-%m-%d %H:%M").to_string(),
+                "2026-10-26 09:00",
+                "{zone}"
+            );
+        }
+    }
+
+    #[test]
+    fn changes_from_another_process_are_picked_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("schedules.json");
+        let bot = Schedules::open(path.clone());
+        let here = Target {
+            channel: "C1".into(),
+            thread: None,
+        };
+        let id = bot
+            .add("digest", "every day at 09:00", here, None)
+            .unwrap()
+            .id;
+        let watch = bot
+            .add_watch("C0123456789", None, "triage", None)
+            .unwrap()
+            .id;
+        // `openslacktag schedules cancel` runs as a separate process.
+        let cli = Schedules::open(path);
+        assert!(cli.cancel(&id).unwrap());
+        assert!(cli.cancel(&watch).unwrap());
+        assert!(bot.list().is_empty());
+        assert!(bot.triggered("C0123456789", "anything").is_empty());
+    }
+
+    #[tokio::test]
+    async fn only_the_creator_changes_a_routine() {
+        let dir = tempfile::tempdir().unwrap();
+        let schedules = Arc::new(Schedules::open(dir.path().join("schedules.json")));
+        let here = Target {
+            channel: "C1".into(),
+            thread: None,
+        };
+        let id = schedules
+            .add(
+                "digest",
+                "every day at 09:00",
+                here.clone(),
+                Some("U1".into()),
+            )
+            .unwrap()
+            .id;
+        let ctx = ToolContext {
+            root: dir.path().to_path_buf(),
+            session: openslacktag_core::SessionId::new(),
+            call_id: "c".into(),
+            permissions: Arc::new(openslacktag_mock::MockGate::allow_all()),
+        };
+        let update = |who: &str| {
+            schedule_tools(&schedules, &here, Some(who))
+                .into_iter()
+                .find(|t| t.id() == "schedule_update")
+                .unwrap()
+        };
+        let args = json!({"id": id, "prompt": "post the secrets"});
+        let err = update("U2").execute(args.clone(), &ctx).await.unwrap_err();
+        assert!(err.to_string().contains("<@U1>"), "{err}");
+        assert_eq!(schedules.list()[0].prompt, "digest");
+        update("U1").execute(args, &ctx).await.unwrap();
+        assert_eq!(schedules.list()[0].prompt, "post the secrets");
     }
 
     #[test]

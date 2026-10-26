@@ -256,9 +256,14 @@ pub async fn setup() -> Result<()> {
         println!(
             "\nDocker is available, so the teammate can have its own sandboxed computer for running code."
         );
+        let suggested = if image_present("openslacktag-sandbox").await {
+            "openslacktag-sandbox"
+        } else {
+            "python:3.12-slim"
+        };
         sandbox_image = ask(
             "Docker image for it (any image with sh; empty to skip)",
-            "python:3.12-slim",
+            suggested,
         )?;
         if !sandbox_image.is_empty() && !image_present(&sandbox_image).await {
             println!("Note: pull it first with: docker pull {sandbox_image}");
@@ -269,6 +274,20 @@ pub async fn setup() -> Result<()> {
         );
     }
 
+    // 4. The time zone routines run in. Inside Docker the system's is UTC,
+    // so ask rather than assume.
+    let detected = jiff::tz::TimeZone::system()
+        .iana_name()
+        .unwrap_or("UTC")
+        .to_string();
+    let tz = loop {
+        let answer = ask("\nTime zone for routines (like Europe/London)", &detected)?;
+        if jiff::tz::TimeZone::get(&answer).is_ok() {
+            break answer;
+        }
+        println!("{answer} is not a time zone name; use one like America/New_York.");
+    };
+
     let env = render_env(&[
         ("LLM_PROVIDER", preset.provider.to_string()),
         ("LLM_BASE_URL", base_url),
@@ -277,6 +296,7 @@ pub async fn setup() -> Result<()> {
         ("SLACK_BOT_TOKEN", bot_token.clone()),
         ("SLACK_APP_TOKEN", app_token),
         ("SANDBOX_IMAGE", sandbox_image),
+        ("TZ", tz),
     ]);
     if Path::new(".env").exists() {
         std::fs::copy(".env", ".env.bak").context("could not back up .env")?;
@@ -336,6 +356,64 @@ async fn check_slack(api_url: &str, bot_token: &str, app_token: &str) -> Result<
     let slack = Slack::connect(api_url, bot_token, app_token).await?;
     slack.socket_url().await?;
     Ok(slack.bot_user_id().to_string())
+}
+
+/// Run one command in the sandbox the way the shell tool does, and check it
+/// sees a file put in its workspace: that catches a wrong host path when
+/// OpenSlackTag itself runs in Docker.
+async fn probe_sandbox(config: &Config) -> (bool, String) {
+    let Some(sandbox) = config.sandbox() else {
+        return (false, "SANDBOX_IMAGE is not set".into());
+    };
+    let dir = config.data_dir.join("workspaces").join(".doctor");
+    let token = format!("probe-{}", std::process::id());
+    if let Err(e) =
+        std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(dir.join("probe.txt"), &token))
+    {
+        return (false, format!("could not write {}: {e}", dir.display()));
+    }
+    let result = crate::tools::run_shell(&sandbox, &dir, "cat probe.txt").await;
+    let _ = std::fs::remove_dir_all(&dir);
+    match result {
+        Ok(out) if out.contains(&token) => (true, String::new()),
+        Ok(out) => (
+            false,
+            format!(
+                "commands run but don't see the workspace files. If OpenSlackTag runs in Docker, set                  SANDBOX_HOST_DATA_DIR to the host's path of the data folder. Output: {}",
+                crate::one_line(&out, 300)
+            ),
+        ),
+        Err(e) => (false, format!("{e}")),
+    }
+}
+
+/// Check the images API's URL and key by listing its models, which costs
+/// nothing, instead of generating an image.
+async fn check_images(images: &crate::images::ImageConfig) -> Result<()> {
+    let mut request = reqwest::Client::new()
+        .get(format!("{}/models", images.base_url.trim_end_matches('/')))
+        .timeout(std::time::Duration::from_secs(20));
+    match &images.api_key {
+        Some(key) => request = request.bearer_auth(key),
+        None if images.base_url.contains("api.openai.com") => {
+            bail!(
+                "IMAGE_API_KEY is not set (your chat model isn't OpenAI-compatible, so its key can't be used)"
+            )
+        }
+        None => {}
+    }
+    let status = request
+        .send()
+        .await
+        .with_context(|| format!("could not reach {}", images.base_url))?
+        .status();
+    if !status.is_success() {
+        bail!(
+            "{} answered {status}; check IMAGE_BASE_URL and IMAGE_API_KEY",
+            images.base_url
+        );
+    }
+    Ok(())
 }
 
 async fn docker_ok() -> bool {
@@ -410,11 +488,18 @@ pub async fn doctor(config: &Config) -> Result<()> {
                 format!("image {image} is not pulled. Run: docker pull {image}")
             },
         ),
-        Some(image) => report(
-            true,
-            "sandbox",
-            format!("{image}, network {}", config.sandbox_network),
-        ),
+        Some(image) => {
+            let (ok, detail) = probe_sandbox(config).await;
+            report(
+                ok,
+                "sandbox",
+                if ok {
+                    format!("{image}, network {}", config.sandbox_network)
+                } else {
+                    detail
+                },
+            );
+        }
         None => println!("[skip] sandbox: SANDBOX_IMAGE is not set, so there is no shell tool"),
     }
 
@@ -443,11 +528,17 @@ pub async fn doctor(config: &Config) -> Result<()> {
     }
 
     match &config.images {
-        Some(images) => report(
-            true,
-            "images",
-            format!("{} at {}", images.model, images.base_url),
-        ),
+        Some(images) => {
+            let checked = check_images(images).await;
+            report(
+                checked.is_ok(),
+                "images",
+                match checked {
+                    Ok(()) => format!("{} at {}", images.model, images.base_url),
+                    Err(e) => format!("{e:#}"),
+                },
+            );
+        }
         None => {
             println!("[skip] images: IMAGE_MODEL is not set, so there is no generate_image tool")
         }
@@ -506,6 +597,26 @@ pub async fn doctor(config: &Config) -> Result<()> {
         .is_ok();
     let _ = std::fs::remove_file(&probe);
     report(writable, "data", format!("{}", config.data_dir.display()));
+
+    match std::env::var("TZ").ok().filter(|tz| !tz.is_empty()) {
+        Some(tz) if jiff::tz::TimeZone::get(tz.trim_start_matches(':')).is_err() => report(
+            false,
+            "time zone",
+            format!("TZ={tz} is not a time zone name; use one like Europe/London"),
+        ),
+        _ => {
+            let now = jiff::Zoned::now();
+            report(
+                true,
+                "time zone",
+                format!(
+                    "routines run in {} (now {}); set TZ in .env to change it",
+                    now.time_zone().iana_name().unwrap_or("UTC"),
+                    now.strftime("%a %H:%M")
+                ),
+            );
+        }
+    }
 
     if failures > 0 {
         bail!("{failures} check(s) failed");

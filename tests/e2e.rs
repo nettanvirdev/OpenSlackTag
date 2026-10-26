@@ -1142,6 +1142,10 @@ async fn channel_triggers_answer_matching_messages_in_their_thread() {
         .unwrap();
     let (fake, api_url) = start_fake_slack().await;
     fake.respond("conversations.replies", json!({"ok": true, "messages": []}));
+    fake.respond(
+        "conversations.info",
+        json!({"ok": true, "channel": {"is_member": true}}),
+    );
     fake.send(channel_message(
         "e1",
         "Ev1",
@@ -1166,16 +1170,29 @@ async fn channel_triggers_answer_matching_messages_in_their_thread() {
         answered(&fake, "Triaged: billing issue, assigned to <@U7>.")
     })
     .await;
-    wait_for("the skip", || !fake.calls_to("chat.delete").is_empty()).await;
+    wait_for("the skip", || model.requests().len() == 2).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
     bot.abort();
 
     let posts = fake.calls_to("chat.postMessage");
     assert_eq!(
         posts.len(),
-        2,
-        "only the two matching messages started work: {posts:?}"
+        1,
+        "a skipped message gets no reply, not even a placeholder: {posts:?}"
     );
     assert_eq!(posts[0]["thread_ts"], "1700000100.000100");
+    let leftovers: Vec<String> = ["transcripts", "workspaces"]
+        .iter()
+        .filter_map(|d| std::fs::read_dir(data.path().join(d)).ok())
+        .flatten()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains("1700000102"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "a skipped run leaves nothing: {leftovers:?}"
+    );
     let requests = model.requests();
     assert!(requests[0].system.contains("Triage support requests"));
     assert!(
@@ -1186,4 +1203,91 @@ async fn channel_triggers_answer_matching_messages_in_their_thread() {
             .text()
             .contains("I need help with billing")
     );
+}
+
+#[tokio::test]
+async fn app_posts_set_off_triggers() {
+    let data = tempfile::tempdir().unwrap();
+    let (engine, model) = engine_with(
+        MockProvider::new().replying("Looking into db-1."),
+        data.path(),
+        Vec::new(),
+    );
+    engine
+        .schedules()
+        .add_watch(
+            "C0123456789",
+            Some("disk"),
+            "Investigate alerts",
+            Some("U9".into()),
+        )
+        .unwrap();
+    let (fake, api_url) = start_fake_slack().await;
+    fake.respond("conversations.replies", json!({"ok": true, "messages": []}));
+    fake.respond(
+        "conversations.info",
+        json!({"ok": true, "channel": {"is_member": true}}),
+    );
+    fake.send(json!({
+        "type": "events_api",
+        "envelope_id": "e1",
+        "payload": {
+            "event_id": "Ev1",
+            "event": {
+                "type": "message", "subtype": "bot_message", "bot_id": "B1",
+                "channel_type": "channel", "channel": "C0123456789", "ts": "1700000100.000100",
+                "text": "",
+                "attachments": [{"title": "Disk full", "text": "db-1 is at 99% disk"}]
+            }
+        }
+    }));
+    let bot = start_bot(engine, &api_url).await;
+    wait_for("the answer", || answered(&fake, "Looking into db-1.")).await;
+    bot.abort();
+    let requests = model.requests();
+    let asked = requests[0].history.last().unwrap().text();
+    assert!(asked.contains("db-1 is at 99% disk"), "{asked}");
+}
+
+#[tokio::test]
+async fn triggers_stop_when_their_creator_cannot_read_the_channel() {
+    let data = tempfile::tempdir().unwrap();
+    let (engine, model) = engine_with(
+        MockProvider::new().replying("should not run"),
+        data.path(),
+        Vec::new(),
+    );
+    engine
+        .schedules()
+        .add_watch(
+            "C0123456789",
+            None,
+            "Summarise everything",
+            Some("U9".into()),
+        )
+        .unwrap();
+    let (fake, api_url) = start_fake_slack().await;
+    fake.respond(
+        "conversations.info",
+        json!({"ok": true, "channel": {"is_private": true}}),
+    );
+    fake.respond(
+        "conversations.members",
+        json!({"ok": true, "members": ["U1"]}),
+    );
+    fake.send(channel_message(
+        "e1",
+        "Ev1",
+        "secret plans",
+        "1700000100.000100",
+    ));
+    let bot = start_bot(engine, &api_url).await;
+    wait_for("the membership check", || {
+        !fake.calls_to("conversations.members").is_empty()
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    bot.abort();
+    assert!(model.requests().is_empty());
+    assert!(fake.calls_to("chat.postMessage").is_empty());
 }

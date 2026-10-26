@@ -14,13 +14,9 @@
 
 services:
   openslacktag:
-    # Root inside the container, to use the mounted socket without matching
-    # the host's docker group id.
-    user: root
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
+      # Sandbox containers are started by the host's Docker; OpenSlackTag
+      # finds the host's path to data/ itself.
       SANDBOX_IMAGE: ${SANDBOX_IMAGE:-openslacktag-sandbox}
-      # Sandbox containers are started by the host's Docker, so they need the
-      # host's path to the data folder, not this container's.
-      SANDBOX_HOST_DATA_DIR: ${PWD}/data

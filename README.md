@@ -84,7 +84,7 @@ docker compose up -d
 
 Setup asks for your model provider and key, then gives you a link to Slack's "create app" page with everything filled in. You install the app, paste two tokens, and setup writes `.env`.
 
-`docker compose up -d` starts the teammate and restarts it after reboots. Settings and data (`.env`, `mcp.json`, `data/`) stay in this folder.
+`docker compose up -d` starts the teammate and restarts it after reboots. Settings and data (`.env`, `mcp.json`, `data/`) stay in this folder, owned by whoever owns the folder.
 
 Then invite it to a channel (`/invite @OpenSlackTag`) and mention it. You can also DM it.
 
@@ -139,9 +139,11 @@ This uses the same engine and tools, in your terminal. With Docker, run `docker 
 Routine times accept these forms:
 - `in 2h`, `every 30m`
 - `every day at 09:00`, `every weekday at 17:30`, `every monday,thursday at 10:00`
-- any cron expression, in your time zone
+- any cron expression
 
-Watches are capped at 30 runs an hour, so a busy channel can't run up a bill.
+Routines run in the time zone set by `TZ` (setup asks for it).
+
+Watches also run on posts from apps such as alerting tools. They are capped at 30 runs an hour, so a busy channel can't run up a bill. Only the person who set up a routine can change or delete it.
 
 ## Commands
 
@@ -181,6 +183,7 @@ Everything lives in `.env` in the folder you run from. [.env.example](.env.examp
 | `SUGGESTIONS_CHANNEL` | off | Channel id for weekly automation suggestions (Mondays 09:00) |
 | `DATA_DIR` | `data` | Wiki, transcripts, workspaces, routines and logs |
 | `COMPACT_AT_TOKENS` | `80000` | When to compact a long conversation |
+| `TZ` | the server's (UTC in Docker) | Time zone routines run in, like `Europe/London` |
 
 ### Permissions and approvals
 
@@ -242,7 +245,7 @@ Each conversation gets its own `/work` folder that persists between commands:
 docker build -t openslacktag-sandbox sandbox/
 ```
 
-When OpenSlackTag itself runs in Docker, add the sandbox override. It mounts the host's Docker socket; read its header first.
+When OpenSlackTag itself runs in Docker, add the sandbox override. It mounts the host's Docker socket; read its header first. OpenSlackTag finds the host's path to `data/` on its own, and `doctor` runs a real command in the sandbox to check that files reach it. If that check fails, set `SANDBOX_HOST_DATA_DIR` to the host's path of the data folder.
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.sandbox.yml up -d
@@ -255,13 +258,18 @@ The teammate acts with your keys, so treat it as a colleague holding your tokens
 - **Who can use it.** Only people in your workspace. Slack Connect guests from other organisations are ignored. `ALLOWED_USERS` narrows it further, and `APPROVERS` controls who can approve risky steps.
 - **Private channels stay private.** It only reads a private channel or DM for someone who is a member of it.
 - **Risky tools ask first.** See [Permissions and approvals](#permissions-and-approvals). It always refuses a fourth identical call in a row.
+- **Routines can't borrow access.**
+  - A watch acts for whoever posted the message, so it reads only what they could read. An app's post gets only its own channel.
+  - Its risky steps go to whoever set it up for approval.
+  - It stops running if that person can no longer read the channel.
+  - Only they can change or delete it.
 - **Web fetches can't reach private networks.** Any URL that resolves to a loopback, private, link-local or carrier-NAT address is refused, including IPv6 forms like NAT64 and 6to4. The check runs on every redirect hop. The checked address is pinned against DNS rebinding, and proxies are bypassed.
 - **The shell only runs in Docker,** never on the host. With `SANDBOX_NETWORK=none` (the default) the container has no network at all. With `bridge` it can reach anything the host can, including your LAN and cloud metadata endpoints, so only use `bridge` where that's acceptable.
 - **The Docker socket is powerful.** The Docker deployment's sandbox override gives the teammate the host's Docker socket. That is root-equivalent on the host, so run it on a machine dedicated to it.
 - **No channel-wide pings.** Replies are escaped for Slack, so only user mentions, channel links and web links survive. `@channel`, `@here` and group mentions never fire, whatever a fetched page says.
-- **Shared files are contained.** Downloads and ZIP archives are unpacked only inside the conversation's workspace. Paths that try to escape are dropped, and archive sizes are capped.
+- **Shared files are contained.** Downloads and ZIP archives are unpacked only inside the conversation's workspace. Paths that try to escape are dropped, and archive sizes are capped. File tools never follow links, so a link made in the sandbox can't reach `.env` or anything else outside the workspace.
 - **One shared wiki.** It's plain Markdown in `DATA_DIR`, shared by every channel. Something learned in a private channel can surface elsewhere, and text someone plants there persists. Review it like any shared doc. The history keeps the last 20 versions of each page, and the teammate is told never to store secrets.
-- **Everything is logged locally.** `data/audit.jsonl` records every tool call, and `data/usage.jsonl` records every model call. Nothing is sent anywhere except your model provider, Slack, and the services your tools call.
+- **Everything is logged locally.** `data/audit.jsonl` records every tool call, and `data/usage.jsonl` records every model call. Logs roll over at 20 MB, keeping one previous file. Nothing is sent anywhere except your model provider, Slack, and the services your tools call.
 - **Keys stay in `.env`.** It's git-ignored, readable only by you, and API keys are kept out of logs.
 
 ## How it works

@@ -2,7 +2,6 @@
 //! `openslacktag usage` prints.
 
 use std::collections::BTreeMap;
-use std::io::Write;
 use std::path::Path;
 
 use anyhow::Result;
@@ -29,12 +28,10 @@ pub fn record(data_dir: &Path, conversation: &str, model: &str, usage: &Usage) {
         output: usage.output_tokens,
     };
     let write = || -> std::io::Result<()> {
-        std::fs::create_dir_all(data_dir)?;
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(data_dir.join("usage.jsonl"))?;
-        writeln!(file, "{}", serde_json::to_string(&line)?)
+        crate::append_line(
+            &data_dir.join("usage.jsonl"),
+            &serde_json::to_string(&line)?,
+        )
     };
     if let Err(e) = write() {
         tracing::warn!("could not record usage: {e}");

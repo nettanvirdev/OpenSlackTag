@@ -147,11 +147,7 @@ impl Wiki {
             "bytes": content.len(),
             "previous": previous,
         });
-        let mut log = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.dir.join(CHANGES))?;
-        std::io::Write::write_all(&mut log, format!("{change}\n").as_bytes())?;
+        crate::append_line(&self.dir.join(CHANGES), &change.to_string())?;
         Ok(())
     }
 
@@ -171,7 +167,7 @@ impl Wiki {
                     .map(|v| format!(", previous version {v}"))
                     .unwrap_or_else(|| ", new page".into());
                 format!(
-                    "{} {} by {} ({} bytes{previous})",
+                    "{} {} from conversation {} ({} bytes{previous})",
                     c["at"]
                         .as_str()
                         .unwrap_or_default()
@@ -303,7 +299,7 @@ fn describe(kind: Kind, sandbox: Option<&Sandbox>) -> String {
             "Read one wiki page, or an earlier version of it (versions are listed by wiki_history).".into()
         }
         Kind::WikiHistory => {
-            "Recent wiki changes (who changed which page, when), for one page or all. To undo a change, read \
+            "Recent wiki changes (which page, when, and from which conversation: <channel id>-<thread>), for one page or all. To undo a change, read \
              the earlier version and write it back."
                 .into()
         }
@@ -492,7 +488,11 @@ fn unique_suffix() -> String {
 
 /// One command in a fresh container, with the conversation's workspace mounted
 /// at /work. `--rm` plus the kill on timeout means no container outlives its command.
-async fn run_shell(sandbox: &Sandbox, workspace: &Path, command: &str) -> Result<String> {
+pub(crate) async fn run_shell(
+    sandbox: &Sandbox,
+    workspace: &Path,
+    command: &str,
+) -> Result<String> {
     let workspace = std::path::absolute(workspace)?;
     std::fs::create_dir_all(&workspace)?;
     let name = format!("openslacktag-{}", unique_suffix());
@@ -508,9 +508,10 @@ async fn run_shell(sandbox: &Sandbox, workspace: &Path, command: &str) -> Result
     .args(["--memory", "1g", "--cpus", "1", "--pids-limit", "256"])
     .args(["--cap-drop", "ALL", "--security-opt", "no-new-privileges"])
     .args(["-e", "HOME=/work"])
-    .arg("-v")
+    // --mount rather than -v: a Windows host path has a colon of its own.
+    .arg("--mount")
     .arg(format!(
-        "{}:/work",
+        "type=bind,source={},target=/work",
         sandbox.mount_source(&workspace).display()
     ));
     // On Linux, run as the owner of the workspace rather than root, so files
@@ -811,7 +812,9 @@ mod tests {
         let history = wiki.history(Some("team/people")).unwrap();
         let lines: Vec<&str> = history.lines().collect();
         assert_eq!(lines.len(), 2, "{history}");
-        assert!(lines[0].contains("by C1-2") && lines[0].contains("previous version"));
+        assert!(
+            lines[0].contains("from conversation C1-2") && lines[0].contains("previous version")
+        );
         assert!(lines[1].contains("new page"));
         let version = lines[0]
             .rsplit("previous version ")

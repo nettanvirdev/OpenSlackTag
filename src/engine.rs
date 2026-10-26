@@ -263,6 +263,16 @@ impl Engine {
         self.path(conversation).exists()
     }
 
+    /// Delete a finished conversation's transcript and files, for runs that
+    /// turned out to need nothing (a channel trigger that answered SKIP).
+    pub fn forget(&self, conversation: &str) {
+        if self.is_running(conversation) {
+            return;
+        }
+        let _ = std::fs::remove_file(self.path(conversation));
+        let _ = std::fs::remove_dir_all(workspace_dir(&self.data_dir, conversation));
+    }
+
     /// Whether a task is running in this conversation.
     pub fn is_running(&self, conversation: &str) -> bool {
         self.running.lock().contains_key(conversation)

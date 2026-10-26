@@ -207,16 +207,19 @@ fn schedules(action: Option<&str>, id: Option<&str>) -> Result<()> {
             if schedules.cancel(id)? {
                 println!("Cancelled {id}.");
             } else {
-                anyhow::bail!("no schedule {id}");
+                anyhow::bail!("no routine {id}");
             }
         }
         (None, _) => {
-            let all = schedules.list();
-            if all.is_empty() {
-                println!("No scheduled tasks. Ask the teammate in Slack to schedule one.");
+            let (all, watches) = (schedules.list(), schedules.watches());
+            if all.is_empty() && watches.is_empty() {
+                println!("No routines. Ask the teammate in Slack to set one up.");
             }
             for s in &all {
                 println!("- {}", schedules.describe(s));
+            }
+            for w in &watches {
+                println!("- {}", openslacktag::schedule::describe_watch(w));
             }
         }
         _ => anyhow::bail!("usage: openslacktag schedules [cancel <id>]"),

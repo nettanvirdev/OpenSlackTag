@@ -30,7 +30,28 @@ pub fn resolve(root: &Path, relative: &str) -> Result<PathBuf> {
             "{relative:?} is not a path inside your workspace; use a relative path like reports/q3.md"
         )));
     }
-    Ok(root.join(path))
+    let full = root.join(path);
+    no_links(root, &full)?;
+    Ok(full)
+}
+
+/// Refuse `path` if anything from `root` down to it is a symlink. The sandbox
+/// can create links, and following one would reach files outside the
+/// workspace, such as `.env`.
+// ponytail: checks then opens, so a link made in between (a parallel helper's
+// shell) still wins; openat2 with RESOLVE_BENEATH if that ever matters.
+fn no_links(root: &Path, path: &Path) -> Result<()> {
+    let mut at = root.to_path_buf();
+    for part in path.strip_prefix(root).unwrap_or(path).components() {
+        at.push(part);
+        if std::fs::symlink_metadata(&at).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(Error::InvalidInput(format!(
+                "{} is a link; files can only be read and written inside your workspace",
+                at.strip_prefix(root).unwrap_or(&at).display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 const MAX_ZIP_ENTRIES: usize = 500;
@@ -65,6 +86,7 @@ pub fn extract_zip(archive: &Path, dest: &Path) -> anyhow::Result<Vec<String>> {
             );
         }
         let path = dest.join(&name);
+        no_links(dest, &path)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -284,6 +306,36 @@ mod tests {
             "hello"
         );
         assert!(!dir.path().join("escape.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn links_made_in_the_sandbox_are_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".env"), "SECRET=1").unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::os::unix::fs::symlink("../.env", ws.join("x")).unwrap();
+        std::os::unix::fs::symlink("..", ws.join("up")).unwrap();
+        let ctx = ctx(&ws);
+        for (tool_id, args) in [
+            ("read_file", json!({"path": "x"})),
+            ("write_file", json!({"path": "x", "content": "y"})),
+            (
+                "write_file",
+                json!({"path": "up/permissions.json", "content": "{}"}),
+            ),
+        ] {
+            assert!(
+                tool(tool_id).execute(args, &ctx).await.is_err(),
+                "{tool_id}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".env")).unwrap(),
+            "SECRET=1"
+        );
+        assert!(!dir.path().join("permissions.json").exists());
     }
 
     #[tokio::test]

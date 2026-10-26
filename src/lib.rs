@@ -54,6 +54,28 @@ pub fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()> 
     Ok(())
 }
 
+/// Logs start over past this size, keeping the previous one as `<name>.1`.
+const MAX_LOG_BYTES: u64 = 20_000_000;
+
+/// Append one line to a log file (audit, usage, feedback, wiki changes),
+/// rotating it so it never grows without bound.
+pub fn append_line(path: &std::path::Path, line: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    if std::fs::metadata(path).is_ok_and(|m| m.len() > MAX_LOG_BYTES) {
+        let mut old = path.as_os_str().to_owned();
+        old.push(".1");
+        std::fs::rename(path, old)?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    writeln!(file, "{line}")
+}
+
 /// The first line of `s`, cut to `max` characters.
 pub fn one_line(s: &str, max: usize) -> String {
     let line = s.lines().next().unwrap_or_default().trim();
@@ -94,6 +116,22 @@ pub fn safe_id(id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    #[test]
+    fn logs_rotate_instead_of_growing_forever() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("audit.jsonl");
+        std::fs::write(&log, vec![b'x'; super::MAX_LOG_BYTES as usize + 1]).unwrap();
+        super::append_line(&log, "{}").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "{}
+"
+        );
+        assert!(dir.path().join("audit.jsonl.1").exists());
+    }
+
     #[test]
     fn one_line_cuts_on_characters() {
         assert_eq!(super::one_line("héllo world\nmore", 5), "héllo…");

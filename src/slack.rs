@@ -142,6 +142,9 @@ struct Event {
     user_team: Option<String>,
     #[serde(default)]
     files: Vec<Value>,
+    /// Where apps such as alerting tools put their content.
+    #[serde(default)]
+    attachments: Vec<Value>,
 }
 
 impl Slack {
@@ -317,19 +320,19 @@ impl Slack {
         }
     }
 
-    /// A new top-level message from a person in a channel, which channel
-    /// triggers may want. Messages that mention the bot are left to the
-    /// mention handler.
+    /// A new top-level message in a channel, which channel triggers may want:
+    /// from a person (on the allowlist, if there is one) or from another app,
+    /// such as an alerting tool. Messages that mention the bot are left to the
+    /// mention handler, and our own posts are never triggers.
     fn channel_message(&self, payload: &Value) -> Option<Event> {
-        let event: Event = serde_json::from_value(payload.get("event")?.clone()).ok()?;
-        let user = event.user.as_deref()?;
+        let mut event: Event = serde_json::from_value(payload.get("event")?.clone()).ok()?;
         let top_level = event.thread_ts.as_deref().is_none_or(|t| t == event.ts);
-        let person = event.bot_id.is_none()
-            && event
-                .subtype
-                .as_deref()
-                .is_none_or(|s| PERSON_SUBTYPES.contains(&s))
-            && user != self.bot_user_id;
+        let subtype = event.subtype.as_deref();
+        let from_app = event.bot_id.is_some() && subtype.is_none_or(|s| s == "bot_message");
+        let from_person = event.bot_id.is_none()
+            && subtype.is_none_or(|s| PERSON_SUBTYPES.contains(&s))
+            && event.user.as_deref().is_some_and(|u| self.is_allowed(u));
+        let ours = event.user.as_deref() == Some(self.bot_user_id.as_str());
         let in_channel = event.kind == "message"
             && matches!(event.channel_type.as_deref(), Some("channel" | "group"));
         let mentions_us = event.text.contains(&format!("<@{}", self.bot_user_id));
@@ -338,14 +341,15 @@ impl Slack {
             .as_deref()
             .is_none_or(|team| self.team_id.is_empty() || team == self.team_id);
         if !(top_level
-            && person
+            && (from_person || from_app)
+            && !ours
             && in_channel
             && !mentions_us
-            && our_workspace
-            && self.is_allowed(user))
+            && our_workspace)
         {
             return None;
         }
+        event.text = message_text(&json!({"text": event.text, "attachments": event.attachments}));
         let key = payload["event_id"]
             .as_str()
             .map_or_else(|| format!("{}:{}", event.channel, event.ts), str::to_string);
@@ -355,18 +359,35 @@ impl Slack {
     /// Run a channel trigger on the message that set it off, in that
     /// message's thread. A trigger that decides the message needs nothing
     /// answers SKIP, and nothing is posted.
+    ///
+    /// It acts for whoever posted the message (an app's post gets only this
+    /// channel), and its risky steps go to whoever set it up for approval.
     async fn run_trigger(
         self: &Arc<Self>,
         engine: &Engine,
         watch: &Watch,
         event: &Event,
     ) -> Result<()> {
-        let conversation = format!("{}-{}", event.channel, event.ts);
+        // Its creator gets to see what it does, so they must be able to read
+        // the channel themselves, now and not just when they set it up.
+        let creator_reads = match &watch.created_by {
+            Some(creator) => self.can_read(&watch.channel, creator).await?,
+            None => false,
+        };
+        if !creator_reads {
+            tracing::warn!(
+                "Skipping trigger {}: whoever set it up can't read {}",
+                watch.id,
+                watch.channel
+            );
+            return Ok(());
+        }
+        // A conversation per trigger, so two triggers on one message both run.
+        let conversation = format!("{}-{}-{}", event.channel, event.ts, watch.id);
         let workspace = workspace_dir(engine.data_dir(), &conversation);
         let incoming = self
             .incoming(event, Some(&event.ts), false, None, &workspace)
             .await?;
-        let placeholder = self.post(&event.channel, Some(&event.ts), WORKING).await?;
         let by = watch
             .created_by
             .as_deref()
@@ -389,14 +410,17 @@ impl Slack {
                 &conversation,
                 incoming,
                 target.clone(),
+                event.user.clone(),
                 watch.created_by.clone(),
                 context,
-                &placeholder,
+                None,
             )
             .await;
-        if matches!(&outcome.reply, Ok(Reply::Answer(text)) if text.trim() == SKIP) {
-            return self.delete(&event.channel, &placeholder).await;
+        if matches!(&outcome.reply, Ok(Reply::Answer(text)) if is_skip(text)) {
+            engine.forget(&conversation);
+            return Ok(());
         }
+        let placeholder = self.post(&event.channel, Some(&event.ts), WORKING).await?;
         self.finish(&target, &placeholder, outcome).await
     }
 
@@ -495,15 +519,18 @@ impl Slack {
                 &conversation,
                 incoming,
                 target.clone(),
+                Some(requester.clone()),
                 Some(requester),
                 context,
-                &placeholder,
+                Some(&placeholder),
             )
             .await;
         self.finish(&target, &placeholder, outcome).await
     }
 
-    /// Run one task with live progress in `placeholder`.
+    /// Run one task, with live progress in `placeholder` if there is one.
+    /// `requester` is who the task acts for (what it may read, who owns what
+    /// it creates); `approver` is who may approve its risky steps.
     #[allow(clippy::too_many_arguments)]
     async fn run_task(
         self: &Arc<Self>,
@@ -512,8 +539,9 @@ impl Slack {
         incoming: Vec<Incoming>,
         target: Target,
         requester: Option<String>,
+        approver: Option<String>,
         context: String,
-        placeholder: &str,
+        placeholder: Option<&str>,
     ) -> TaskOutcome {
         let started = Instant::now();
         let (progress, mut events) = mpsc::unbounded_channel::<Progress>();
@@ -522,7 +550,7 @@ impl Slack {
             let (slack, channel, ts, steps) = (
                 self.clone(),
                 target.channel.clone(),
-                placeholder.to_string(),
+                placeholder.map(str::to_string),
                 steps.clone(),
             );
             tokio::spawn(async move {
@@ -537,9 +565,12 @@ impl Slack {
                         }
                         next = events.try_recv().ok();
                     }
-                    if let Some(note) = doing {
-                        let text = format!("_{}…_", crate::one_line(&note, 150));
-                        let _ = slack.update(&channel, &ts, &text).await;
+                    if let (Some(note), Some(ts)) = (doing, &ts) {
+                        let text = format!(
+                            "_{}…_",
+                            crate::markdown::escape(&crate::one_line(&note, 150))
+                        );
+                        let _ = slack.update(&channel, ts, &text).await;
                         tokio::time::sleep(PROGRESS_INTERVAL).await;
                     }
                 }
@@ -549,7 +580,7 @@ impl Slack {
             slack: self.clone(),
             channel: target.channel.clone(),
             thread: target.thread.clone(),
-            requester: requester.clone(),
+            requester: approver,
         });
         let tools = slack_tools(self, &target, requester.as_deref());
         let reply = engine
@@ -623,7 +654,10 @@ impl Slack {
             .collect();
         let mut context = Vec::new();
         if !steps.is_empty() {
-            let summary = format!(":white_check_mark: {}", crate::steps::summarize(steps));
+            let summary = format!(
+                ":white_check_mark: {}",
+                crate::markdown::escape(&crate::steps::summarize(steps))
+            );
             context.push(json!({"type": "mrkdwn", "text": short(&summary, 1900)}));
             self.remember_steps(&key, steps);
         }
@@ -723,8 +757,9 @@ impl Slack {
                 incoming,
                 target.clone(),
                 schedule.created_by.clone(),
+                schedule.created_by.clone(),
                 context,
-                &placeholder,
+                Some(&placeholder),
             )
             .await;
         self.finish(&target, &placeholder, outcome).await
@@ -782,7 +817,8 @@ impl Slack {
                     let reply = if good {
                         "Thanks! Glad that helped."
                     } else {
-                        "Thanks for saying so. Reply in the thread with what was wrong and I'll fix it                          (and remember it if it's about how your team works)."
+                        "Thanks for saying so. Mention me in this thread with what was wrong and I'll fix it, \
+                         and remember it if it's about how your team works."
                     };
                     self.whisper(&channel, &user, reply);
                     continue;
@@ -792,7 +828,7 @@ impl Slack {
                     let text = match steps {
                         Some(steps) => steps
                             .iter()
-                            .map(|s| format!("• {s}"))
+                            .map(|s| format!("• {}", crate::markdown::escape(s)))
                             .collect::<Vec<_>>()
                             .join(
                                 "
@@ -871,15 +907,7 @@ impl Slack {
             "good": good,
             "steps": self.steps.lock().get(answer).cloned().unwrap_or_default(),
         });
-        let write = || -> std::io::Result<()> {
-            use std::io::Write;
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)?;
-            writeln!(file, "{line}")
-        };
-        if let Err(e) = write() {
+        if let Err(e) = crate::append_line(&path, &line.to_string()) {
             tracing::warn!("Could not record feedback: {e}");
         }
     }
@@ -995,7 +1023,7 @@ impl Slack {
         {
             return None;
         }
-        let text = m["text"].as_str().unwrap_or("");
+        let text = &message_text(m);
         let user = m["user"].as_str().unwrap_or("");
         let cursor = m["ts"].as_str().map(str::to_string);
         if user == self.bot_user_id {
@@ -1082,7 +1110,7 @@ impl Slack {
             bail!("larger than {} MB", MAX_FILE_BYTES / 1_000_000);
         }
         let relative = format!("inbox/{name}");
-        let path = workspace.join(&relative);
+        let path = crate::files::resolve(workspace, &relative)?;
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
@@ -1090,7 +1118,10 @@ impl Slack {
         let mut relative = relative;
         if name.to_lowercase().ends_with(".zip") {
             let folder = format!("inbox/{}", name[..name.len() - 4].trim_end_matches('.'));
-            match crate::files::extract_zip(&path, &workspace.join(&folder)) {
+            let unpacked = crate::files::resolve(workspace, &folder)
+                .map_err(anyhow::Error::from)
+                .and_then(|dest| crate::files::extract_zip(&path, &dest));
+            match unpacked {
                 Ok(files) => {
                     relative = format!(
                         "{relative}, unpacked into {folder}/ ({} files)",
@@ -1747,6 +1778,39 @@ impl RecentIds {
     }
 }
 
+/// A message's text plus what apps put in attachments (title, text,
+/// fallback), which is where alerting tools say what happened.
+fn message_text(m: &Value) -> String {
+    let mut text = m["text"].as_str().unwrap_or_default().to_string();
+    for a in m["attachments"].as_array().into_iter().flatten() {
+        let part = ["title", "text"]
+            .iter()
+            .filter_map(|k| a[*k].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let part = if part.is_empty() {
+            a["fallback"].as_str().unwrap_or_default().to_string()
+        } else {
+            part
+        };
+        if !part.is_empty() && !text.contains(&part) {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(&part);
+        }
+    }
+    text
+}
+
+/// Whether a trigger decided the message needs nothing, allowing for the
+/// punctuation and formatting models add ("SKIP.", "*SKIP*").
+fn is_skip(text: &str) -> bool {
+    text.trim()
+        .trim_matches(|c: char| !c.is_ascii_alphanumeric())
+        .eq_ignore_ascii_case(SKIP)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1772,6 +1836,25 @@ mod tests {
 
     fn payload(id: &str, event: &Value) -> Value {
         json!({"event_id": id, "event": event})
+    }
+
+    #[test]
+    fn skip_allows_for_formatting() {
+        for text in ["SKIP", " skip. ", "*SKIP*", "`SKIP`"] {
+            assert!(is_skip(text), "{text}");
+        }
+        assert!(!is_skip("Skipping lunch is bad"));
+    }
+
+    #[test]
+    fn app_attachments_count_as_text() {
+        let m = json!({"text": "", "attachments": [{"title": "Disk full", "text": "db-1"}, {"fallback": "old style"}]});
+        assert_eq!(
+            message_text(&m),
+            "Disk full
+db-1
+old style"
+        );
     }
 
     #[test]

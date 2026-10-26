@@ -126,7 +126,7 @@ impl Tool for GenerateImage {
                 format!("image-{}", &uuid::Uuid::new_v4().simple().to_string()[..6])
             });
         let relative = format!("images/{stem}.png");
-        let path = ctx.root.join(&relative);
+        let path = crate::files::resolve(&ctx.root, &relative)?;
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
