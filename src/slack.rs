@@ -2008,12 +2008,12 @@ old style"
 
         let post = Approval {
             tool: "slack_post_message".into(),
-            target: "C0C76NF24BH".into(),
+            target: "C0123456789".into(),
             detail: None,
         };
         let (_, blocks) = approval_card("abc", &post, None);
         let body = blocks[0]["text"]["text"].as_str().unwrap();
-        assert!(body.contains("in <#C0C76NF24BH>"), "{body}");
+        assert!(body.contains("in <#C0123456789>"), "{body}");
     }
 
     #[test]
