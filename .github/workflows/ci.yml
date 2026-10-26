@@ -5,10 +5,13 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  # The release workflow runs these checks on every version tag first.
+  workflow_call:
 
 jobs:
   check:
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}

@@ -121,11 +121,17 @@ impl Wiki {
             if old == content {
                 return Ok(());
             }
-            let version = jiff::Timestamp::now()
-                .strftime("%Y%m%dT%H%M%S%3fZ")
+            let stamp = jiff::Timestamp::now()
+                .strftime("%Y%m%dT%H%M%S%6fZ")
                 .to_string();
             let dir = self.dir.join(VERSIONS).join(page);
             std::fs::create_dir_all(&dir)?;
+            // A counter keeps quick successive edits from overwriting each
+            // other, and keeps names sorting in order.
+            let version = (0..1000)
+                .map(|n| format!("{stamp}{n:03}"))
+                .find(|v| !dir.join(format!("{v}.md")).exists())
+                .ok_or_else(|| Error::InvalidInput("too many edits at once".into()))?;
             std::fs::write(dir.join(format!("{version}.md")), old)?;
             prune_versions(&dir);
             previous = Some(version);

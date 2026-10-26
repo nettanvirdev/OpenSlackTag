@@ -1,0 +1,144 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640" role="img" aria-label="OpenSlackTag: the open-source AI teammate for Slack. Someone asks it to chart a CSV; it answers in the thread with a chart and asks before running a command.">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0B1020"/>
+      <stop offset="1" stop-color="#1E1B4B"/>
+    </linearGradient>
+    <linearGradient id="at" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2DD4BF"/>
+      <stop offset="1" stop-color="#8B5CF6"/>
+    </linearGradient>
+    <linearGradient id="bar" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2DD4BF"/>
+      <stop offset="1" stop-color="#6366F1"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#8B5CF6" stop-opacity="0.45"/>
+      <stop offset="1" stop-color="#8B5CF6" stop-opacity="0"/>
+    </radialGradient>
+    <pattern id="dots" width="28" height="28" patternUnits="userSpaceOnUse">
+      <circle cx="2" cy="2" r="1.4" fill="#FFFFFF" fill-opacity="0.07"/>
+    </pattern>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="14" stdDeviation="18" flood-color="#000000" flood-opacity="0.45"/>
+    </filter>
+    <symbol id="mark" viewBox="0 0 512 512">
+      <rect width="512" height="512" rx="112" fill="#312E81"/>
+      <rect x="88" y="104" width="336" height="272" rx="76" fill="#F8FAFC"/>
+      <path d="M150 352 L112 430 L222 366 Z" fill="#F8FAFC" stroke="#F8FAFC" stroke-width="8" stroke-linejoin="round"/>
+      <g fill="none" stroke="url(#at)" stroke-width="22" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="256" cy="240" r="34"/>
+        <path d="M290 206 V262 Q290 292 314 292 Q340 292 340 240 A84 84 0 1 0 310 304"/>
+      </g>
+      <path d="M412 72 Q412 112 452 112 Q412 112 412 152 Q412 112 372 112 Q412 112 412 72 Z" fill="#FBBF24"/>
+    </symbol>
+    <symbol id="check" viewBox="0 0 24 24">
+      <circle cx="12" cy="12" r="12" fill="#2DD4BF" fill-opacity="0.16"/>
+      <path d="M7 12.5 L10.5 16 L17 8.5" fill="none" stroke="#2DD4BF" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>
+    </symbol>
+  </defs>
+
+  <rect width="1280" height="640" fill="url(#bg)"/>
+  <rect width="1280" height="640" fill="url(#dots)"/>
+  <circle cx="930" cy="300" r="380" fill="url(#glow)"/>
+
+  <g font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+
+    <!-- Left: name and pitch -->
+    <use href="#mark" x="80" y="80" width="84" height="84"/>
+    <text x="80" y="246" font-size="66" font-weight="800" fill="#FFFFFF" letter-spacing="-1.5">OpenSlackTag</text>
+    <text x="80" y="298" font-size="30" fill="#CBD5E1">The open-source AI</text>
+    <text x="80" y="338" font-size="30" fill="#CBD5E1"><tspan fill="#2DD4BF" font-weight="700">teammate</tspan> for Slack.</text>
+
+    <g font-size="19" fill="#E2E8F0">
+      <use href="#check" x="80" y="390" width="24" height="24"/>
+      <text x="116" y="408">Does real work with real tools</text>
+      <use href="#check" x="80" y="430" width="24" height="24"/>
+      <text x="116" y="448">Asks before risky steps</text>
+      <use href="#check" x="80" y="470" width="24" height="24"/>
+      <text x="116" y="488">Runs routines on its own</text>
+      <use href="#check" x="80" y="510" width="24" height="24"/>
+      <text x="116" y="528">Any model. Self-hosted.</text>
+    </g>
+
+    <g font-size="14" font-weight="600" fill="#A5B4FC" text-anchor="middle">
+      <rect x="80" y="562" width="64" height="30" rx="15" fill="none" stroke="#4F46E5"/>
+      <text x="112" y="582">Rust</text>
+      <rect x="154" y="562" width="64" height="30" rx="15" fill="none" stroke="#4F46E5"/>
+      <text x="186" y="582">MCP</text>
+      <rect x="228" y="562" width="84" height="30" rx="15" fill="none" stroke="#4F46E5"/>
+      <text x="270" y="582">Docker</text>
+      <rect x="322" y="562" width="60" height="30" rx="15" fill="none" stroke="#4F46E5"/>
+      <text x="352" y="582">MIT</text>
+    </g>
+
+    <!-- Right: a Slack thread -->
+    <g filter="url(#shadow)">
+      <rect x="660" y="56" width="560" height="424" rx="18" fill="#FFFFFF"/>
+    </g>
+    <text x="688" y="88" font-size="18" font-weight="700" fill="#1D1C1D">Thread</text>
+    <text x="758" y="88" font-size="15" fill="#616061"># growth</text>
+    <line x1="660" y1="106" x2="1220" y2="106" stroke="#E5E7EB"/>
+
+    <!-- The ask -->
+    <rect x="688" y="124" width="40" height="40" rx="9" fill="#F59E0B"/>
+    <text x="708" y="151" font-size="19" font-weight="700" fill="#FFFFFF" text-anchor="middle">M</text>
+    <text x="742" y="140" font-size="16" font-weight="700" fill="#1D1C1D">Maya <tspan font-size="13" font-weight="400" fill="#8A8A8A">10:42</tspan></text>
+    <text x="742" y="164" font-size="15" fill="#1D1C1D"><tspan fill="#1264A3" font-weight="600">@OpenSlackTag</tspan> chart weekly signups from this CSV</text>
+    <rect x="742" y="178" width="172" height="40" rx="8" fill="#FFFFFF" stroke="#DDDDDD"/>
+    <rect x="752" y="186" width="24" height="24" rx="5" fill="#1D7F4E"/>
+    <path d="M758 193 H770 M758 198 H770 M758 203 H766" stroke="#FFFFFF" stroke-width="2" stroke-linecap="round"/>
+    <text x="786" y="203" font-size="14" fill="#1D1C1D">signups.csv</text>
+
+    <!-- The answer -->
+    <use href="#mark" x="688" y="236" width="40" height="40"/>
+    <text x="742" y="252" font-size="16" font-weight="700" fill="#1D1C1D">OpenSlackTag</text>
+    <rect x="868" y="239" width="34" height="17" rx="4" fill="#E8E8E8"/>
+    <text x="885" y="252" font-size="10" font-weight="700" fill="#616061" text-anchor="middle">APP</text>
+    <text x="912" y="252" font-size="13" fill="#8A8A8A">10:43</text>
+    <text x="742" y="276" font-size="15" fill="#1D1C1D">Signups grew <tspan font-weight="700">18%</tspan> in six weeks. Here's the chart:</text>
+
+    <rect x="742" y="290" width="300" height="104" rx="8" fill="#F8FAFC" stroke="#E2E8F0"/>
+    <text x="754" y="308" font-size="11" font-weight="600" fill="#64748B">Weekly signups</text>
+    <g fill="url(#bar)">
+      <rect x="770" y="350" width="28" height="32" rx="4"/>
+      <rect x="816" y="344" width="28" height="38" rx="4"/>
+      <rect x="862" y="346" width="28" height="36" rx="4"/>
+      <rect x="908" y="334" width="28" height="48" rx="4"/>
+      <rect x="954" y="326" width="28" height="56" rx="4"/>
+      <rect x="1000" y="316" width="28" height="66" rx="4"/>
+    </g>
+    <line x1="760" y1="382" x2="1032" y2="382" stroke="#CBD5E1"/>
+
+    <text x="742" y="420" font-size="13" fill="#616061">✓ Read signups.csv, ran Python, shared a chart · 14s</text>
+    <g font-size="13" fill="#1D1C1D" text-anchor="middle">
+      <rect x="742" y="434" width="84" height="28" rx="6" fill="#FFFFFF" stroke="#D1D5DB"/>
+      <text x="784" y="453">Helpful</text>
+      <rect x="834" y="434" width="104" height="28" rx="6" fill="#FFFFFF" stroke="#D1D5DB"/>
+      <text x="886" y="453">Not helpful</text>
+      <rect x="946" y="434" width="104" height="28" rx="6" fill="#FFFFFF" stroke="#D1D5DB"/>
+      <text x="998" y="453">Show steps</text>
+    </g>
+
+    <!-- An approval card -->
+    <g filter="url(#shadow)">
+      <rect x="600" y="500" width="560" height="112" rx="16" fill="#FFFFFF"/>
+    </g>
+    <rect x="600" y="500" width="7" height="112" rx="3" fill="#FBBF24"/>
+    <text x="630" y="530" font-size="16" font-weight="700" fill="#1D1C1D">Run this in the sandbox?</text>
+    <rect x="630" y="540" width="268" height="26" rx="6" fill="#F1F5F9"/>
+    <text x="642" y="558" font-size="14" fill="#334155" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">python chart.py signups.csv</text>
+    <g font-size="13" font-weight="600" text-anchor="middle">
+      <rect x="630" y="576" width="76" height="28" rx="6" fill="#16A34A"/>
+      <text x="668" y="595" fill="#FFFFFF">Allow</text>
+      <rect x="714" y="576" width="112" height="28" rx="6" fill="#FFFFFF" stroke="#D1D5DB"/>
+      <text x="770" y="595" fill="#1D1C1D">Always allow</text>
+      <rect x="834" y="576" width="68" height="28" rx="6" fill="#FFFFFF" stroke="#D1D5DB"/>
+      <text x="868" y="595" fill="#DC2626">Deny</text>
+    </g>
+  </g>
+
+  <!-- Sparks -->
+  <path d="M1236 520 Q1236 540 1256 540 Q1236 540 1236 560 Q1236 540 1216 540 Q1236 540 1236 520 Z" fill="#2DD4BF" fill-opacity="0.8"/>
+  <path d="M620 40 Q620 54 634 54 Q620 54 620 68 Q620 54 606 54 Q620 54 620 40 Z" fill="#FBBF24" fill-opacity="0.85"/>
+</svg>
